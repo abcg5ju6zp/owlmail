@@ -66,7 +66,7 @@ fits each workflow:
 
 ## OwlMail 0.10.1
 
-`v0.10.1` is the current stable maintenance release. It fixes a plain SMTP listener startup/shutdown race and updates the Go toolchain to 1.27.2, soulteary kits, and third-party dependencies. Runtime APIs and storage formats remain compatible with 0.10.0. The security protections introduced in 0.10.0 remain enabled. See [the 0.10.1 release notes](./docs/en/Release-0.10.1.md).
+`v0.10.1` is the current stable maintenance release. It fixes a plain SMTP listener startup/shutdown race and updates the Go toolchain to 1.27.2, soulteary kits, and third-party dependencies. Runtime APIs and storage formats remain compatible with 0.10.0. The security protections introduced in 0.10.0 remain enabled. See [the 0.10.1 release notes](./docs/en/Release-0.10.1.md) · [0.10.0 release notes](./docs/en/Release-0.10.0.md).
 
 > [!IMPORTANT]
 > OwlMail is built for development, testing, CI, and trusted internal networks.

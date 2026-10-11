@@ -62,7 +62,7 @@ Ereignisse und AI Agents eine begrenzte, schreibgeschützte MCP-Schnittstelle.
 
 ## OwlMail 0.10.1
 
-`v0.10.1` ist die aktuelle stabile Wartungsversion. Sie behebt ein Start-/Stopp-Rennen des SMTP-Listeners und aktualisiert Go auf 1.27.2 sowie Kits und Abhängigkeiten. APIs, Speicherformate und die Schutzmaßnahmen aus 0.10.0 bleiben erhalten. [Release Notes](./docs/en/Release-0.10.1.md).
+`v0.10.1` ist die aktuelle stabile Wartungsversion. Sie behebt ein Start-/Stopp-Rennen des SMTP-Listeners und aktualisiert Go auf 1.27.2 sowie Kits und Abhängigkeiten. APIs, Speicherformate und die Schutzmaßnahmen aus 0.10.0 bleiben erhalten. [Release Notes](./docs/en/Release-0.10.1.md) · [0.10.0 release notes](./docs/en/Release-0.10.0.md).
 
 > [!IMPORTANT]
 > OwlMail ist für Entwicklung, Tests, CI und vertrauenswürdige interne Netze

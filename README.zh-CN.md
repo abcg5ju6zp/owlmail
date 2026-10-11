@@ -62,7 +62,7 @@ OwlMail 在应用邮件进入真实邮箱前将其捕获，并转换为确定、
 
 ## OwlMail 0.10.1
 
-`v0.10.1` 是当前稳定维护版本，修复普通 SMTP listener 启停竞态，并升级 Go 1.27.2、soulteary kit 和第三方依赖。运行时 API 与存储格式兼容 0.10.0，保留该版本引入的安全保护。详见 [0.10.1 发布说明](./docs/zh-CN/Release-0.10.1.md)。
+`v0.10.1` 是当前稳定维护版本，修复普通 SMTP listener 启停竞态，并升级 Go 1.27.2、soulteary kit 和第三方依赖。运行时 API 与存储格式兼容 0.10.0，保留该版本引入的安全保护。详见 [0.10.1 发布说明](./docs/zh-CN/Release-0.10.1.md) · [0.10.0 release notes](./docs/zh-CN/Release-0.10.0.md)。
 
 > [!IMPORTANT]
 > OwlMail 面向开发、测试、CI 与可信内部网络，不是公网生产 MTA、

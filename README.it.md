@@ -62,7 +62,7 @@ automazioni eventi durevoli e gli agenti AI un MCP limitato in sola lettura.
 
 ## OwlMail 0.10.1
 
-`v0.10.1` è la versione stabile di manutenzione. Corregge una race all’avvio/arresto del listener SMTP e aggiorna Go a 1.27.2, kit e dipendenze. API, formati di archiviazione e protezioni di 0.10.0 restano compatibili. [Note di rilascio](./docs/en/Release-0.10.1.md).
+`v0.10.1` è la versione stabile di manutenzione. Corregge una race all’avvio/arresto del listener SMTP e aggiorna Go a 1.27.2, kit e dipendenze. API, formati di archiviazione e protezioni di 0.10.0 restano compatibili. [Note di rilascio](./docs/en/Release-0.10.1.md) · [0.10.0 release notes](./docs/en/Release-0.10.0.md).
 
 > [!IMPORTANT]
 > OwlMail è destinato a sviluppo, test, CI e reti interne affidabili; non è un

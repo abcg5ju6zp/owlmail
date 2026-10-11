@@ -29,7 +29,7 @@ Select your preferred language:
 - [Testing Recipes](./en/Testing-Recipes.md)
 - [Architecture](./en/Architecture.md) and [Security Model](./en/Security-Model.md)
 - [Runnable JavaScript, Go, Python, and Compose examples](../examples/testing/README.md)
-- [OwlMail 0.10.1 Release Notes](./en/Release-0.10.1.md)
+- [OwlMail 0.10.1 Release Notes](./en/Release-0.10.1.md) · [0.10.0 release notes](./en/Release-0.10.0.md)
 - [OwlMail 0.9.0 Release Notes](./en/Release-0.9.0.md)
 - [API Reference](./en/API-Reference.md)
 - [OpenAPI 3.1 Contract (JSON)](../openapi/openapi.json) / [YAML](../openapi/openapi.yaml)

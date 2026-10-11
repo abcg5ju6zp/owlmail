@@ -17,3 +17,53 @@
 ## 升级
 
 使用 `ghcr.io/soulteary/owlmail:0.10.1` 或已验证的镜像 digest。运行时 API、配置和存储格式兼容 0.10.0，并保留其安全保护。更早版本的部署还应阅读 [0.10.0 迁移说明](Release-0.10.0.md)。
+
+## 安装
+
+```bash
+docker pull ghcr.io/soulteary/owlmail:0.10.1
+docker run --rm \
+  -p 127.0.0.1:1025:1025 \
+  -p 127.0.0.1:1080:1080 \
+  -v owlmail-data:/app/mail \
+  ghcr.io/soulteary/owlmail:0.10.1
+```
+
+为了可重复部署，请记录已发布的 manifest digest 并使用
+`ghcr.io/soulteary/owlmail@sha256:<digest>`。
+
+## 发布文件
+
+- `checksums.txt`
+- `checksums.txt.sigstore.json`
+- `owlmail-linux-amd64` 与 `owlmail-linux-amd64.spdx.json`
+- `owlmail-linux-arm64` 与 `owlmail-linux-arm64.spdx.json`
+- `owlmail-darwin-amd64` 与 `owlmail-darwin-amd64.spdx.json`
+- `owlmail-darwin-arm64` 与 `owlmail-darwin-arm64.spdx.json`
+- `owlmail-windows-amd64.exe` 与
+  `owlmail-windows-amd64.exe.spdx.json`
+
+Linux amd64 下载、校验与启动示例：
+
+```bash
+curl -fLO https://github.com/soulteary/owlmail/releases/download/v0.10.1/owlmail-linux-amd64
+curl -fLO https://github.com/soulteary/owlmail/releases/download/v0.10.1/checksums.txt
+curl -fLO https://github.com/soulteary/owlmail/releases/download/v0.10.1/checksums.txt.sigstore.json
+grep ' owlmail-linux-amd64$' checksums.txt | sha256sum -c -
+gh attestation verify owlmail-linux-amd64 --repo soulteary/owlmail
+cosign verify-blob \
+  --bundle checksums.txt.sigstore.json \
+  --certificate-identity-regexp '^https://github.com/soulteary/owlmail/.github/workflows/release.yml@refs/tags/v' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  checksums.txt
+chmod +x owlmail-linux-amd64
+./owlmail-linux-amd64
+```
+
+```bash
+cosign verify \
+  --certificate-identity-regexp '^https://github.com/soulteary/owlmail/.github/workflows/release.yml@refs/tags/v' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  ghcr.io/soulteary/owlmail:0.10.1
+```
+

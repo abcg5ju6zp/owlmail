@@ -63,7 +63,7 @@ borné en lecture seule.
 
 ## OwlMail 0.10.1
 
-`v0.10.1` est la version stable de maintenance. Elle corrige une course au démarrage/arrêt du listener SMTP et met à jour Go vers 1.27.2, les kits et les dépendances. Les API, les formats de stockage et les protections de 0.10.0 sont conservés. [Notes de version](./docs/en/Release-0.10.1.md).
+`v0.10.1` est la version stable de maintenance. Elle corrige une course au démarrage/arrêt du listener SMTP et met à jour Go vers 1.27.2, les kits et les dépendances. Les API, les formats de stockage et les protections de 0.10.0 sont conservés. [Notes de version](./docs/en/Release-0.10.1.md) · [0.10.0 release notes](./docs/en/Release-0.10.0.md).
 
 > [!IMPORTANT]
 > OwlMail cible le développement, les tests, la CI et les réseaux internes de
