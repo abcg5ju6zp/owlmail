@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -158,5 +159,19 @@ func TestProbeHealthExternalIPCertificate(t *testing.T) {
 	}
 	if err := probeHealth(cfg); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestHealthcheckScopedIPv6URL(t *testing.T) {
+	raw := healthcheckURL("http", healthcheckHost("[fe80::1%eth0]"), 1080, "/mail")
+	if raw != "http://[fe80::1%25eth0]:1080/mail/healthz" {
+		t.Fatalf("URL=%q", raw)
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Hostname() != "fe80::1%eth0" {
+		t.Fatalf("hostname=%q", parsed.Hostname())
 	}
 }

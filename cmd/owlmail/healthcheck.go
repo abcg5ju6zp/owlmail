@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -86,7 +87,7 @@ func probeHealth(cfg *config.Config) error {
 	}
 	client := &http.Client{Transport: transport, Timeout: 2 * time.Second,
 		CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
-	response, err := client.Get(fmt.Sprintf("%s://%s%s/healthz", scheme, net.JoinHostPort(host, fmt.Sprint(cfg.WebPort)), base))
+	response, err := client.Get(healthcheckURL(scheme, host, cfg.WebPort, base))
 	if err != nil {
 		return fmt.Errorf("healthcheck request failed: %w", err)
 	}
@@ -108,4 +109,8 @@ func healthcheckHost(host string) string {
 		host = "::1"
 	}
 	return host
+}
+
+func healthcheckURL(scheme, host string, port int, base string) string {
+	return (&url.URL{Scheme: scheme, Host: net.JoinHostPort(host, fmt.Sprint(port)), Path: base + "/healthz"}).String()
 }
