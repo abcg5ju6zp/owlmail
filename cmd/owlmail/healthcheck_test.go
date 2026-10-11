@@ -163,7 +163,10 @@ func TestProbeHealthExternalIPCertificate(t *testing.T) {
 }
 
 func TestHealthcheckScopedIPv6URL(t *testing.T) {
-	raw := healthcheckURL("http", healthcheckHost("[fe80::1%eth0]"), 1080, "/mail")
+	raw, err := healthcheckURL("http", healthcheckHost("[fe80::1%eth0]"), 1080, "/mail")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if raw != "http://[fe80::1%25eth0]:1080/mail/healthz" {
 		t.Fatalf("URL=%q", raw)
 	}
@@ -173,5 +176,35 @@ func TestHealthcheckScopedIPv6URL(t *testing.T) {
 	}
 	if parsed.Hostname() != "fe80::1%eth0" {
 		t.Fatalf("hostname=%q", parsed.Hostname())
+	}
+}
+
+func TestProbeHealthEscapedBasePaths(t *testing.T) {
+	for _, base := range []string{"/team%20mail", "/caf%C3%A9"} {
+		t.Run(base, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.RequestURI != base+"/healthz" {
+					t.Errorf("RequestURI=%q", r.RequestURI)
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer server.Close()
+			host, port, err := net.SplitHostPort(server.Listener.Addr().String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg := config.DefaultConfig()
+			cfg.WebHost = host
+			cfg.WebPort, err = strconv.Atoi(port)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg.BasePathname = base
+			if err := probeHealth(cfg); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
