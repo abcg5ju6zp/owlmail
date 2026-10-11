@@ -79,6 +79,8 @@ func probeHealth(cfg *config.Config) error {
 		name := host
 		if len(cert.DNSNames) > 0 {
 			name = strings.Replace(cert.DNSNames[0], "*.", "healthcheck.", 1)
+		} else if len(cert.IPAddresses) > 0 {
+			name = cert.IPAddresses[0].String()
 		}
 		transport.TLSClientConfig = &tls.Config{RootCAs: roots, ServerName: name, MinVersion: tls.VersionTLS12}
 	}

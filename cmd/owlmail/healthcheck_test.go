@@ -1,7 +1,13 @@
 package main
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/pem"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -9,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/soulteary/owlmail/internal/config"
 )
@@ -113,6 +120,40 @@ func TestProbeHealthBracketedIPv6(t *testing.T) {
 	cfg.WebHost = "[::1]"
 	cfg.WebPort, err = strconv.Atoi(port)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := probeHealth(cfg); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestProbeHealthExternalIPCertificate(t *testing.T) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := &x509.Certificate{SerialNumber: big.NewInt(1), NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour), IPAddresses: []net.IP{net.ParseIP("192.0.2.10")}, KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }))
+	server.TLS = &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}}, MinVersion: tls.VersionTLS12}
+	server.StartTLS()
+	defer server.Close()
+	_, port, err := net.SplitHostPort(server.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.DefaultConfig()
+	cfg.WebHost = "0.0.0.0"
+	cfg.WebPort, err = strconv.Atoi(port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.HTTPSEnabled = true
+	cfg.HTTPSCertFile = filepath.Join(t.TempDir(), "cert.pem")
+	if err := os.WriteFile(cfg.HTTPSCertFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0600); err != nil {
 		t.Fatal(err)
 	}
 	if err := probeHealth(cfg); err != nil {
