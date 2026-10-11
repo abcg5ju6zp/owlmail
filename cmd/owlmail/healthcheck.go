@@ -69,8 +69,15 @@ func probeHealth(cfg *config.Config) error {
 		}
 		// Trust only the configured local server certificate. A DNS SAN supplies
 		// the verification name while the connection still targets the bind host.
-		block, _ := pem.Decode(certificatePEM)
-		if block == nil {
+		var block *pem.Block
+		remaining := certificatePEM
+		for len(remaining) > 0 {
+			block, remaining = pem.Decode(remaining)
+			if block == nil || block.Type == "CERTIFICATE" {
+				break
+			}
+		}
+		if block == nil || block.Type != "CERTIFICATE" {
 			return fmt.Errorf("invalid HTTPS certificate")
 		}
 		cert, err := x509.ParseCertificate(block.Bytes)

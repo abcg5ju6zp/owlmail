@@ -58,7 +58,9 @@ func TestProbeHealth(t *testing.T) {
 			if secure {
 				pair := server.TLS.Certificates[0]
 				cfg.HTTPSCertFile = filepath.Join(t.TempDir(), "cert.pem")
-				if err := os.WriteFile(cfg.HTTPSCertFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: pair.Certificate[0]}), 0600); err != nil {
+				if err := os.WriteFile(cfg.HTTPSCertFile, append(
+					pem.EncodeToMemory(&pem.Block{Type: "EC PARAMETERS", Bytes: []byte{0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07}}),
+					pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: pair.Certificate[0]})...), 0600); err != nil {
 					t.Fatal(err)
 				}
 			}
