@@ -87,3 +87,35 @@ func TestHealthcheckConfigFile(t *testing.T) {
 		t.Fatalf("config=%+v err=%v", cfg, err)
 	}
 }
+
+func TestHealthcheckIPv6Hosts(t *testing.T) {
+	for input, want := range map[string]string{"[::1]": "::1", "[::]": "::1", "::": "::1", "::1": "::1", "[2001:db8::1]": "2001:db8::1", "0.0.0.0": "127.0.0.1", "localhost": "localhost"} {
+		if got := healthcheckHost(input); got != want {
+			t.Errorf("healthcheckHost(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
+func TestProbeHealthBracketedIPv6(t *testing.T) {
+	listener, err := net.Listen("tcp", "[::1]:0")
+	if err != nil {
+		t.Skipf("IPv6 loopback unavailable: %v", err)
+	}
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }))
+	server.Listener = listener
+	server.Start()
+	defer server.Close()
+	_, port, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.DefaultConfig()
+	cfg.WebHost = "[::1]"
+	cfg.WebPort, err = strconv.Atoi(port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := probeHealth(cfg); err != nil {
+		t.Fatal(err)
+	}
+}

@@ -52,13 +52,7 @@ func probeHealth(cfg *config.Config) error {
 	if err != nil {
 		return err
 	}
-	host := cfg.WebHost
-	if host == "" || host == "0.0.0.0" {
-		host = "127.0.0.1"
-	}
-	if host == "::" {
-		host = "::1"
-	}
+	host := healthcheckHost(cfg.WebHost)
 	scheme := "http"
 	transport := &http.Transport{Proxy: nil}
 	defer transport.CloseIdleConnections()
@@ -99,4 +93,17 @@ func probeHealth(cfg *config.Config) error {
 		return fmt.Errorf("healthcheck returned HTTP %d", response.StatusCode)
 	}
 	return nil
+}
+
+func healthcheckHost(host string) string {
+	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		host = strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
+	}
+	if host == "" || host == "0.0.0.0" {
+		host = "127.0.0.1"
+	}
+	if host == "::" {
+		host = "::1"
+	}
+	return host
 }
