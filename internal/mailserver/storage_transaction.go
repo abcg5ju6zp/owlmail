@@ -146,7 +146,7 @@ func (ms *MailServer) storeIncomingEmail(id string, r io.Reader, session *Sessio
 		return errors.Join(fmt.Errorf("sync mail directory: %w", err), rollbackErr)
 	}
 
-	if err := ms.saveEmailToStore(id, false, envelope, email, true, true); err != nil {
+	if err := ms.saveEmailToStore(id, false, envelope, email, true, true, true); err != nil {
 		rollbackErr := ms.rollbackIncomingEmail(id, finalEML, finalAttachments)
 		committedEML = false
 		committedAttachments = false
@@ -488,7 +488,67 @@ func (ms *MailServer) newQuarantineEntry(id, reason string) (string, error) {
 	if err := os.Mkdir(destination, 0750); err != nil {
 		return "", err
 	}
+	if err := writeQuarantineExplanation(destination, id, reason); err != nil {
+		_ = os.RemoveAll(destination)
+		return "", err
+	}
 	return destination, nil
+}
+
+// quarantineExplanationFileName is written into every quarantine entry so an
+// operator can tell why the artifact was isolated without reconstructing the
+// crash that produced it.
+const quarantineExplanationFileName = "OWLMAIL-RECOVERY.txt"
+
+func quarantineExplanation(id, reason string) string {
+	detail, known := map[string]string{
+		"corrupt": "The message bytes could not be parsed as an email. They were never published to the mailbox.",
+		"incomplete": "An SMTP receive transaction left this staged artifact behind after exiting before its commit point. It was never published to the mailbox.",
+		"orphan-attachments": "This attachment directory had no matching committed email (.eml) or transaction marker, so it could not be attributed to a published message.",
+		"orphan-metadata": "This metadata sidecar had no matching committed email (.eml) or transaction marker, so it could not be attributed to a published message.",
+	}[reason]
+	if !known {
+		detail = "The artifact could not be attributed to a committed message."
+	}
+	return fmt.Sprintf(
+		"OwlMail storage recovery\n"+
+			"Quarantined at: %s\n"+
+			"Receive identity: %s\n"+
+			"Reason: %s\n"+
+			"Explanation: %s\n"+
+			"Action: OwlMail moved the artifact here so no API can observe it as a partial message.\n"+
+			"To restore it, stop OwlMail and move the contents back under the mail directory using the receive identity above; otherwise delete this directory.\n",
+		time.Now().UTC().Format(time.RFC3339Nano), id, reason, detail)
+}
+
+func writeQuarantineExplanation(destination, id, reason string) error {
+	path := filepath.Join(destination, quarantineExplanationFileName)
+	tmp, err := os.CreateTemp(destination, ".explanation-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	committed := false
+	defer func() {
+		_ = tmp.Close()
+		if !committed {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if _, err := tmp.WriteString(quarantineExplanation(id, reason)); err != nil {
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+	committed = true
+	return syncDirectory(destination)
 }
 
 func sanitizeQuarantineName(value string) string {
@@ -526,4 +586,66 @@ func (ms *MailServer) quarantineOrphanAttachmentDirectories() error {
 		}
 	}
 	return nil
+}
+
+// quarantineOrphanMetadata isolates metadata sidecars whose receiving
+// identity no longer has a committed EML or an in-progress transaction
+// fence. A deletion, rollback, or accepted-handoff fence means another
+// recovery path still owns the identity, so such sidecars are left alone.
+func (ms *MailServer) quarantineOrphanMetadata() error {
+	directory := filepath.Join(ms.mailDir, metadataDirectoryName)
+	entries, err := os.ReadDir(directory)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read metadata directory for recovery: %w", err)
+	}
+	var recoveryErrors []error
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		// Leftover atomic-write temp files carry no receive identity; they
+		// are interrupted, unpublished metadata writes.
+		if strings.HasPrefix(entry.Name(), ".state-") && strings.HasSuffix(entry.Name(), ".tmp") {
+			if err := ms.quarantinePath(filepath.Join(directory, entry.Name()), "incomplete"); err != nil {
+				recoveryErrors = append(recoveryErrors, fmt.Errorf("quarantine incomplete metadata %s: %w", entry.Name(), err))
+			}
+			continue
+		}
+		if !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		id := strings.TrimSuffix(entry.Name(), ".json")
+		if validateEmailID(id) != nil {
+			continue
+		}
+		metadataPath := filepath.Join(directory, entry.Name())
+		if ms.mailboxIndex != nil && ms.mailboxIndex.OwnsPath(metadataPath) {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(ms.mailDir, id+".eml")); err == nil {
+			continue
+		} else if !errors.Is(err, os.ErrNotExist) {
+			recoveryErrors = append(recoveryErrors, fmt.Errorf("stat email for metadata %s: %w", entry.Name(), err))
+			continue
+		}
+		if _, err := os.Stat(deletionFencePath(ms.mailDir, id)); err == nil {
+			continue
+		} else if !errors.Is(err, os.ErrNotExist) {
+			recoveryErrors = append(recoveryErrors, fmt.Errorf("stat deletion fence for %s: %w", id, err))
+			continue
+		}
+		if _, err := os.Stat(rollbackFencePath(ms.mailDir, id)); err == nil {
+			continue
+		} else if !errors.Is(err, os.ErrNotExist) {
+			recoveryErrors = append(recoveryErrors, fmt.Errorf("stat rollback fence for %s: %w", id, err))
+			continue
+		}
+		if err := ms.quarantinePath(metadataPath, "orphan-metadata"); err != nil {
+			recoveryErrors = append(recoveryErrors, fmt.Errorf("quarantine orphan metadata %s: %w", entry.Name(), err))
+		}
+	}
+	return errors.Join(recoveryErrors...)
 }

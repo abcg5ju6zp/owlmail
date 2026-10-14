@@ -40,10 +40,22 @@ var ErrEmailNotFound = errors.New("email not found")
 func (ms *MailServer) SaveEmailToStore(id string, isRead bool, envelope *Envelope, parsedEmail *Email) error {
 	ms.storageTransactionMutex.RLock()
 	defer ms.storageTransactionMutex.RUnlock()
-	return ms.saveEmailToStore(id, isRead, envelope, parsedEmail, true, false)
+	return ms.saveEmailToStore(id, isRead, envelope, parsedEmail, true, false, true)
 }
 
-func (ms *MailServer) saveEmailToStore(id string, isRead bool, envelope *Envelope, parsedEmail *Email, persistMetadata, finalizeRollbackFence bool) error {
+// saveEmailToStore publishes one email under its stable receiving identity.
+//
+// The durable preparation phase (metadata sidecar, synchronous handoff,
+// commit fence, mailbox index row) completes while the message is still
+// invisible. Only after every durable step succeeds does the in-memory
+// mailbox, delivery cursor and asynchronous notifications commit together
+// under the store lock. A failure during preparation rolls every durable
+// step back, so no API can observe a partially published message.
+//
+// announce controls post-commit notifications. Startup recovery resumes a
+// commit that already happened (or never decided) and must not notify,
+// relay, or count it a second time.
+func (ms *MailServer) saveEmailToStore(id string, isRead bool, envelope *Envelope, parsedEmail *Email, persistMetadata, finalizeRollbackFence, announce bool) error {
 	emlPath := filepath.Join(ms.mailDir, id+".eml")
 	if !ms.retainAllHeaders.Load() {
 		parsedEmail.AllHeaders = nil
@@ -96,25 +108,45 @@ func (ms *MailServer) saveEmailToStore(id string, isRead bool, envelope *Envelop
 	if receivedAt.IsZero() {
 		receivedAt = time.Now().UTC()
 	}
+
+	// ---- Durable publish preparation. Nothing below is API-visible until
+	// every step has succeeded and the in-memory commit at the end runs. ----
+	var prepareErr error
 	if persistMetadata {
 		// New mail must have durable initial metadata before it becomes visible.
 		if err := ms.persistEmailMetadataAt(storedEmail, receivedAt); err != nil {
-			ms.storeMutex.Unlock()
-			return fmt.Errorf("persist email metadata: %w", err)
+			prepareErr = fmt.Errorf("persist email metadata: %w", err)
 		}
 	}
-	hasTransactionalHandoff := ms.hasSynchronousListener("new")
-	handoffErr := ms.emitSynchronous("new", storedEmail)
-	if handoffErr == nil && hasTransactionalHandoff {
+	hasTransactionalHandoff := false
+	if prepareErr == nil {
+		hasTransactionalHandoff = ms.hasSynchronousListener("new")
+		if err := ms.emitSynchronous("new", storedEmail); err != nil {
+			prepareErr = err
+		}
+	}
+	// The derived mailbox index row must exist before the commit fence below
+	// records the decision: every durable publish input (metadata, handoff,
+	// index) is confirmed while the message is still invisible and can still
+	// be rolled back cleanly. An upsert failure rejects the whole message
+	// instead of splitting it across the index and the mailbox.
+	reservedStorePosition := -1
+	if prepareErr == nil && persistMetadata && ms.mailboxIndex != nil && ms.mailboxIndexReady.Load() {
+		reservedStorePosition = ms.mailboxStorePositionLocked(id)
+		if err := ms.mailboxIndex.Upsert(makeIndexedEmail(storedEmail, receivedAt, reservedStorePosition)); err != nil {
+			prepareErr = fmt.Errorf("publish mailbox index: %w", err)
+		}
+	}
+	if prepareErr == nil && hasTransactionalHandoff {
 		if finalizeRollbackFence {
-			handoffErr = ms.acceptRollbackFence(id)
+			prepareErr = ms.acceptRollbackFence(id)
 		} else {
-			handoffErr = ms.createAcceptedHandoffFence(id)
+			prepareErr = ms.createAcceptedHandoffFence(id)
 		}
-	} else if handoffErr == nil && finalizeRollbackFence {
-		handoffErr = ms.completeLocalRollbackFence(id)
+	} else if prepareErr == nil && finalizeRollbackFence {
+		prepareErr = ms.completeLocalRollbackFence(id)
 	}
-	if handoffErr != nil {
+	if prepareErr != nil {
 		var rollbackErr error
 		if persistMetadata {
 			if existed {
@@ -125,6 +157,15 @@ func (ms *MailServer) saveEmailToStore(id string, isRead bool, envelope *Envelop
 					rollbackErr = syncStorageDirectory(filepath.Join(ms.mailDir, metadataDirectoryName))
 				}
 			}
+			if ms.mailboxIndex != nil && ms.mailboxIndexReady.Load() {
+				if existed {
+					if err := ms.mailboxIndex.Upsert(makeIndexedEmail(previousEmail, previousReceivedAt, ms.storePositionByID[id])); err != nil {
+						rollbackErr = errors.Join(rollbackErr, fmt.Errorf("restore previous mailbox index row: %w", err))
+					}
+				} else if err := ms.mailboxIndex.Delete(id); err != nil {
+					rollbackErr = errors.Join(rollbackErr, fmt.Errorf("roll back mailbox index: %w", err))
+				}
+			}
 		}
 		ms.storeMutex.Unlock()
 		if hasTransactionalHandoff {
@@ -133,36 +174,48 @@ func (ms *MailServer) saveEmailToStore(id string, isRead bool, envelope *Envelop
 			ms.emitNotificationAndWait("new-rollback", storedEmail)
 		}
 		if rollbackErr != nil {
-			return errors.Join(handoffErr, fmt.Errorf("roll back email metadata: %w", rollbackErr))
+			return errors.Join(prepareErr, fmt.Errorf("roll back email publish: %w", rollbackErr))
 		}
-		return handoffErr
+		return prepareErr
 	}
+
+	// ---- Joint in-memory commit. Map and delivery-cursor mutation cannot
+	// fail and runs in one critical section, so REST, compatibility APIs and
+	// delivery waits either see the whole message or none of it. ----
 	if !existed {
 		ms.storeOrder = append(ms.storeOrder, id)
 	}
 	ms.receivedAtByID[id] = receivedAt
 	ms.storeByID[id] = storedEmail
 	ms.recordDeliveryLocked(id)
-	ms.upsertMailboxIndexLocked(storedEmail, receivedAt)
-	if persistMetadata {
+	if reservedStorePosition < 0 {
+		// Recovery of a previously published message while the index is live
+		// still needs its derived row. Fresh publishes inserted it above.
+		ms.upsertMailboxIndexLocked(storedEmail, receivedAt)
+	}
+	if persistMetadata && !existed {
+		// Confirming the same receiving identity again must not double count.
 		ms.receivedMessages.Add(1)
 	}
 	ms.storeMutex.Unlock()
 
 	common.Log("Saving email: %s, id: %s", parsedEmail.Subject, id)
 
-	// Notify asynchronous listeners only after the durable handoff and in-memory
-	// commit both succeed.
-	ms.emitAsynchronous("new", storedEmail)
+	// Notify asynchronous listeners only after the durable handoff and the
+	// joint in-memory commit both succeed. Recovery suppresses this so a
+	// restart confirms the existing identity instead of notifying twice.
+	if announce {
+		ms.emitAsynchronous("new", storedEmail)
 
-	// Auto relay if enabled
-	if ms.IsAutoRelayEnabled() {
-		if err := ms.RelayMail(cloneEmail(storedEmail), true, func(err error) {
-			if err != nil {
-				common.Error("Error when auto-relaying email: %v", err)
+		// Auto relay if enabled
+		if ms.IsAutoRelayEnabled() {
+			if err := ms.RelayMail(cloneEmail(storedEmail), true, func(err error) {
+				if err != nil {
+					common.Error("Error when auto-relaying email: %v", err)
+				}
+			}); err != nil {
+				common.Error("Error when initiating auto-relay: %v", err)
 			}
-		}); err != nil {
-			common.Error("Error when initiating auto-relay: %v", err)
 		}
 	}
 
@@ -407,6 +460,18 @@ func (ms *MailServer) DeleteAllEmail() error {
 	}
 	var deletionErrors []error
 	for _, id := range ids {
+		// Bulk deletion only touches published mail. An identity behind an
+		// active, rejected, or unreadable transaction fence belongs to
+		// startup recovery, never to the mailbox snapshot.
+		fencePath := rollbackFencePath(ms.mailDir, id)
+		if state, stateErr := readRollbackFenceState(fencePath); stateErr == nil {
+			if state != acceptedFenceState && state != localFenceState {
+				continue
+			}
+		} else if !os.IsNotExist(stateErr) {
+			deletionErrors = append(deletionErrors, fmt.Errorf("read transaction fence for %s: %w", id, stateErr))
+			continue
+		}
 		if ms.mailboxIndex != nil && ms.mailboxIndex.OwnsPath(filepath.Join(ms.mailDir, id)) {
 			deletionErrors = append(deletionErrors, fmt.Errorf("delete %s: mailbox index is stored inside the email attachment directory", id))
 			continue
@@ -449,6 +514,11 @@ func (ms *MailServer) DeleteAllEmail() error {
 				continue
 			}
 			if _, fenced := deletionFenceID(file.Name()); fenced {
+				continue
+			}
+			// Unpublished staged writes belong to receive recovery, not to
+			// the published mailbox that bulk deletion is allowed to clear.
+			if strings.HasPrefix(file.Name(), storageTempPrefix) {
 				continue
 			}
 			path := filepath.Join(ms.mailDir, file.Name())
@@ -1032,7 +1102,7 @@ func (ms *MailServer) LoadMailsFromDirectory() error {
 					persistRestoredMetadata = true
 				}
 			}
-			if storeErr := ms.saveEmailToStore(id, markAsRead, envelope, email, false, false); storeErr != nil {
+			if storeErr := ms.saveEmailToStore(id, markAsRead, envelope, email, false, false, false); storeErr != nil {
 				loadErrors = append(loadErrors, fmt.Errorf("restore email %s: %w", id, storeErr))
 				continue
 			}
@@ -1066,6 +1136,9 @@ func (ms *MailServer) LoadMailsFromDirectory() error {
 		}
 	}
 	if err := ms.quarantineOrphanAttachmentDirectories(); err != nil {
+		loadErrors = append(loadErrors, err)
+	}
+	if err := ms.quarantineOrphanMetadata(); err != nil {
 		loadErrors = append(loadErrors, err)
 	}
 
