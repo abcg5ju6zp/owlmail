@@ -203,9 +203,11 @@ func (api *API) mailCatcherEML(c fiber.Ctx) error {
 
 func (api *API) mailCatcherRaw(c fiber.Ctx, contentType string, download bool) error {
 	id := c.Params("id")
-	if _, err := api.mailServer.GetEmail(id); err != nil {
+	_, release, err := api.acquireDownloadSource(id)
+	if err != nil {
 		return c.Status(http.StatusNotFound).SendString("Message does not exist")
 	}
+	defer release()
 	path, err := api.mailServer.GetRawEmail(id)
 	if err != nil {
 		return c.Status(http.StatusInternalServerError).SendString("Message source could not be read")
@@ -218,7 +220,7 @@ func (api *API) mailCatcherRaw(c fiber.Ctx, contentType string, download bool) e
 }
 
 func (api *API) mailCatcherPart(c fiber.Ctx) error {
-	email, err := api.mailServer.GetEmail(c.Params("id"))
+	email, release, err := api.acquireDownloadSource(c.Params("id"))
 	if err != nil {
 		return c.Status(http.StatusNotFound).SendString("Message does not exist")
 	}
@@ -235,10 +237,12 @@ func (api *API) mailCatcherPart(c fiber.Ctx) error {
 		}
 	}
 	if selected == nil {
+		release()
 		return c.Status(http.StatusNotFound).SendString("Message part does not exist")
 	}
 	reader, err := api.mailServer.OpenEmailAttachment(email.ID, selected.GeneratedFileName)
 	if err != nil {
+		release()
 		return c.Status(http.StatusInternalServerError).SendString("Message part could not be read")
 	}
 	contentType := reader.ContentType
@@ -246,11 +250,12 @@ func (api *API) mailCatcherPart(c fiber.Ctx) error {
 	if strings.EqualFold(selected.ContentDisposition, "attachment") {
 		c.Set(fiber.HeaderContentDisposition, mime.FormatMediaType("attachment", map[string]string{"filename": selected.FileName}))
 	}
+	body := releaseOnStreamClose(reader.Body, release)
 	maxInt := int64(^uint(0) >> 1)
 	if reader.Size >= 0 && reader.Size <= maxInt {
-		return c.SendStream(reader.Body, int(reader.Size))
+		return c.SendStream(body, int(reader.Size))
 	}
-	return c.SendStream(reader.Body)
+	return c.SendStream(body)
 }
 
 func (api *API) mailCatcherDelete(c fiber.Ctx) error {

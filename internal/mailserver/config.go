@@ -137,6 +137,7 @@ func NewMailServerWithOptions(port int, host, mailDir string, options ServerOpti
 		storeOrder:              make([]string, 0),
 		receivedAtByID:          make(map[string]time.Time),
 		storePositionByID:       make(map[string]int),
+		runCleanups:             newRunCleanupRegistry(),
 		mailDir:                 mailDir,
 		runtimeReadiness:        options.RuntimeReadiness,
 		relayJobHealthRequired:  options.RequireRelayJobReadiness,

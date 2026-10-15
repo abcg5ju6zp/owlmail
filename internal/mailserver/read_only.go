@@ -190,15 +190,26 @@ func (ms *MailServer) RefreshReadOnlyMailbox() error {
 
 	newEmails := make([]*Email, 0, len(loaded))
 	ms.storeMutex.Lock()
+	removedFloor := uint64(0)
 	for id := range ms.storeByID {
 		if _, ok := candidates[id]; !ok {
 			if _, uncertain := uncertainIDs[id]; uncertain {
 				continue
 			}
+			// Read-only observers keep no graveyard: a removed delivery
+			// creates a permanent replay hole, so every cursor that could
+			// still need that sequence must expire deterministically.
+			if sequence := ms.deliverySequences[id]; sequence > removedFloor {
+				removedFloor = sequence
+			}
 			delete(ms.storeByID, id)
 			ms.removeDeliveryLocked(id)
 			delete(ms.receivedAtByID, id)
 		}
+	}
+	if removedFloor > 0 {
+		ms.invalidateDeliveriesBeforeLocked(removedFloor)
+		ms.notifyDeliveryChangedLocked()
 	}
 	for id, item := range candidates {
 		if email := ms.storeByID[id]; email != nil {

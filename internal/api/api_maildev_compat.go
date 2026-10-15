@@ -239,9 +239,11 @@ func (api *API) mailDevEmailHTML(c fiber.Ctx) error {
 
 func (api *API) mailDevEmailSource(c fiber.Ctx) error {
 	id := c.Params("id")
-	if _, err := api.mailServer.GetEmail(id); err != nil {
+	_, release, err := api.acquireDownloadSource(id)
+	if err != nil {
 		return mailDevError(c, http.StatusNotFound, "Email was not found")
 	}
+	defer release()
 	content, err := api.mailServer.GetRawEmailContent(id)
 	if err != nil {
 		return mailDevError(c, http.StatusNotFound, err.Error())
@@ -252,9 +254,11 @@ func (api *API) mailDevEmailSource(c fiber.Ctx) error {
 
 func (api *API) mailDevDownloadEmail(c fiber.Ctx) error {
 	id := c.Params("id")
-	if _, err := api.mailServer.GetEmail(id); err != nil {
+	_, release, err := api.acquireDownloadSource(id)
+	if err != nil {
 		return mailDevError(c, http.StatusNotFound, "Email was not found")
 	}
+	defer release()
 	path, err := api.mailServer.GetRawEmail(id)
 	if err != nil {
 		return mailDevError(c, http.StatusNotFound, err.Error())
@@ -266,11 +270,12 @@ func (api *API) mailDevDownloadEmail(c fiber.Ctx) error {
 
 func (api *API) mailDevAttachment(c fiber.Ctx) error {
 	id := c.Params("id")
-	email, err := api.mailServer.GetEmail(id)
+	email, release, err := api.acquireDownloadSource(id)
 	if err != nil {
 		return mailDevError(c, http.StatusNotFound, "Email was not found")
 	}
 	if len(email.Attachments) == 0 {
+		release()
 		return mailDevError(c, http.StatusNotFound, "Email has no attachments")
 	}
 	found := false
@@ -281,10 +286,12 @@ func (api *API) mailDevAttachment(c fiber.Ctx) error {
 		}
 	}
 	if !found {
+		release()
 		return mailDevError(c, http.StatusNotFound, "Attachment not found")
 	}
 	attachment, err := api.mailServer.OpenEmailAttachment(id, c.Params("filename"))
 	if err != nil {
+		release()
 		return mailDevError(c, http.StatusNotFound, err.Error())
 	}
 	contentType := attachment.ContentType
@@ -292,11 +299,12 @@ func (api *API) mailDevAttachment(c fiber.Ctx) error {
 		contentType = "application/octet-stream"
 	}
 	setAttachmentResponseHeaders(c, contentType, c.Params("filename"))
+	body := releaseOnStreamClose(attachment.Body, release)
 	maxInt := int64(^uint(0) >> 1)
 	if attachment.Size >= 0 && attachment.Size <= maxInt {
-		return c.SendStream(attachment.Body, int(attachment.Size))
+		return c.SendStream(body, int(attachment.Size))
 	}
-	return c.SendStream(attachment.Body)
+	return c.SendStream(body)
 }
 
 func (api *API) mailDevRelayEmail(c fiber.Ctx) error {

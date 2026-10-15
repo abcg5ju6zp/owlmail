@@ -136,6 +136,11 @@ func (api *API) StartRelayRecovery() {
 		if api.relayJobs.hasQueued() {
 			go api.recoverRelayJobs()
 		}
+		// Take over run-cleanup snapshots interrupted by a restart. This runs
+		// after queued relay sources were registered, so queued sources are
+		// preserved as relay_pending instead of being deleted. Errors are
+		// logged inside and never block startup.
+		go api.resumeRunCleanups()
 	})
 }
 

@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
@@ -64,32 +65,77 @@ func (api *API) getEmailHTML(c fiber.Ctx) error {
 	return c.SendString(html)
 }
 
+// acquireDownloadSource pins the email source while a download is open, so a
+// concurrent run cleanup reports source_in_use and keeps the artifacts instead
+// of removing a half-streamed message.
+func (api *API) acquireDownloadSource(id string) (*mailserver.Email, func(), error) {
+	return api.mailServer.AcquireEmailSource(id)
+}
+
+// releaseOnStreamClose keeps the source protected for the lifetime of an HTTP
+// body stream: fasthttp reads body streams after the handler returns, so the
+// release has to follow the stream's Close rather than a handler defer.
+func releaseOnStreamClose(body io.ReadCloser, release func()) io.ReadCloser {
+	var once sync.Once
+	return &streamSourceRelease{body: body, release: func() { once.Do(release) }}
+}
+
+type streamSourceRelease struct {
+	body    io.ReadCloser
+	release func()
+}
+
+func (s *streamSourceRelease) Read(p []byte) (int, error) {
+	n, err := s.body.Read(p)
+	if err != nil {
+		// EOF or stream error: fasthttp is done with the source.
+		s.release()
+	}
+	return n, err
+}
+
+func (s *streamSourceRelease) Close() error {
+	s.release()
+	if s.body != nil {
+		return s.body.Close()
+	}
+	return nil
+}
+
 // getAttachment handles GET /api/v1/emails/:id/attachments/:filename
 func (api *API) getAttachment(c fiber.Ctx) error {
 	id := c.Params("id")
 	filename := c.Params("filename")
 
+	_, release, err := api.acquireDownloadSource(id)
+	if err != nil {
+		return c.Status(fiber.StatusNotFound).JSON(ErrorResponse(ErrorCodeEmailNotFound, err.Error()))
+	}
+
 	attachment, err := api.mailServer.OpenEmailAttachment(id, filename)
 	if err != nil {
+		release()
 		return c.Status(fiber.StatusNotFound).JSON(ErrorResponse(ErrorCodeEmailNotFound, err.Error()))
 	}
 
 	setAttachmentResponseHeaders(c, attachment.ContentType, filename)
 	maxInt := int64(^uint(0) >> 1)
+	body := releaseOnStreamClose(attachment.Body, release)
 	if attachment.Size >= 0 && attachment.Size <= maxInt {
-		return c.SendStream(attachment.Body, int(attachment.Size))
+		return c.SendStream(body, int(attachment.Size))
 	}
-	return c.SendStream(attachment.Body)
+	return c.SendStream(body)
 }
 
 // downloadEmail handles GET /api/v1/emails/:id/raw
 func (api *API) downloadEmail(c fiber.Ctx) error {
 	id := c.Params("id")
 
-	email, err := api.mailServer.GetEmail(id)
+	email, release, err := api.acquireDownloadSource(id)
 	if err != nil {
 		return c.Status(fiber.StatusNotFound).JSON(ErrorResponse(ErrorCodeEmailNotFound, "Email not found"))
 	}
+	defer release()
 
 	emlPath, err := api.mailServer.GetRawEmail(id)
 	if err != nil {
@@ -109,6 +155,12 @@ func (api *API) downloadEmail(c fiber.Ctx) error {
 // getEmailSource handles GET /api/v1/emails/:id/source
 func (api *API) getEmailSource(c fiber.Ctx) error {
 	id := c.Params("id")
+
+	_, release, err := api.acquireDownloadSource(id)
+	if err != nil {
+		return c.Status(fiber.StatusNotFound).JSON(ErrorResponse(ErrorCodeEmailNotFound, err.Error()))
+	}
+	defer release()
 
 	path, err := api.mailServer.GetRawEmail(id)
 	if err != nil {
@@ -468,8 +520,16 @@ func (api *API) exportEmails(c fiber.Ctx) error {
 	return c.SendStreamWriter(func(writer *bufio.Writer) {
 		zipWriter := zip.NewWriter(writer)
 		for _, item := range items {
+			// Acquire per message so a concurrent cleanup skips a source that
+			// is mid-export, matching the unreadable-message skip below.
+			_, release, acquireErr := api.acquireDownloadSource(item.id)
+			if acquireErr != nil {
+				common.Verbose("Skip email removed during export: %s", item.id)
+				continue
+			}
 			emailFile, err := os.Open(item.path)
 			if err != nil {
+				release()
 				common.Verbose("Failed to open email during export: %v", err)
 				continue
 			}
@@ -479,6 +539,7 @@ func (api *API) exportEmails(c fiber.Ctx) error {
 				_, err = io.Copy(fileWriter, emailFile)
 			}
 			_ = emailFile.Close()
+			release()
 			if err != nil {
 				common.Verbose("Failed to stream email into export: %v", err)
 			}

@@ -6,6 +6,23 @@ All notable changes to OwlMail are documented in this file. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `DELETE /api/v1/test-runs/:runID/emails` now deletes a fixed, paginated
+  snapshot: the matching set is pinned once, pages continue with opaque
+  `cursor`/`next_cursor` tokens and `limit` (1..1000), and per-email failures
+  report `relay_pending`, `source_in_use`, or `storage_unavailable` without
+  aborting the round. Unfinished snapshots persist under
+  `.owlmail-meta/run-cleanups` and are silently taken over after a restart;
+  deletions use a recoverable layered tombstone.
+- Delivery waits stay correct across deletions: a single delete keeps the
+  message replayable for registered waiters via a 150-second graveyard and
+  wakes them; reclaimed windows fail deterministically with HTTP 400
+  `CURSOR_EXPIRED`.
+- Raw/source/attachment downloads (v1, MailDev, MailCatcher) and ZIP export
+  pin the email source while streaming, so concurrent run cleanup reports
+  `source_in_use` instead of removing an in-flight source.
+
 ## [0.11.1] - 2026-10-13
 
 Completes the 0.11 feature release after the 0.11.0 publication was interrupted.

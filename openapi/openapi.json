@@ -1762,7 +1762,7 @@
             }
           },
           "400": {
-            "description": "Invalid cursor, selector, or request",
+            "description": "Invalid cursor, selector, or request; code CURSOR_EXPIRED when the cursor's replay window was reclaimed (deletion, global clear, read-only refresh)",
             "content": {
               "application/json": {
                 "schema": {
@@ -1852,14 +1852,55 @@
           "Emails"
         ],
         "operationId": "deleteTestRunEmails",
-        "summary": "Delete a bounded snapshot of one test run",
+        "summary": "Delete exactly the emails pinned by one test-run snapshot",
+        "description": "Deletes emails of one test run with fixed, paginated snapshots. Without `cursor`, the currently visible set is pinned once and emails arriving afterwards belong to a later round; the same run's unfinished snapshot is resumed instead of pinning a new one. A `cursor` continues that exact snapshot. Members blocked by a pending relay (`relay_pending`), an active reader (`source_in_use`), or a storage failure (`storage_unavailable`) are reported per email and keep their source data. Continue with `next_cursor` while `more_possible` is true.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "runID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "description": "Opaque next_cursor token from the previous page. Omit to pin/resume; an unknown, stale, or foreign cursor returns 400.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "Maximum deletions in this page, 1..1000. Defaults to 1000.",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1000,
+              "default": 1000
+            }
+          }
+        ],
         "responses": {
           "200": {
-            "description": "Successful result",
+            "description": "Page outcome; the snapshot stays fixed even if members fail",
             "content": {
               "application/json": {
                 "schema": {
                   "type": "object",
+                  "required": [
+                    "run_id",
+                    "deleted",
+                    "failed",
+                    "failures",
+                    "more_possible"
+                  ],
                   "properties": {
                     "run_id": {
                       "type": "string"
@@ -1868,16 +1909,43 @@
                       "type": "array",
                       "items": {
                         "type": "string"
-                      }
+                      },
+                      "description": "IDs deleted on this page"
                     },
                     "failed": {
+                      "type": "integer",
+                      "description": "Number of failures on this page"
+                    },
+                    "failures": {
                       "type": "array",
                       "items": {
-                        "type": "string"
+                        "type": "object",
+                        "required": [
+                          "id",
+                          "reason"
+                        ],
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "reason": {
+                            "type": "string",
+                            "enum": [
+                              "relay_pending",
+                              "source_in_use",
+                              "storage_unavailable"
+                            ]
+                          }
+                        }
                       }
                     },
                     "more_possible": {
-                      "type": "boolean"
+                      "type": "boolean",
+                      "description": "True when the snapshot has more members"
+                    },
+                    "next_cursor": {
+                      "type": "string",
+                      "description": "Present exactly when more_possible is true"
                     }
                   }
                 }
@@ -1885,7 +1953,7 @@
             }
           },
           "400": {
-            "description": "Invalid cursor, selector, or request",
+            "description": "Invalid run id, cursor, limit, or request; code CURSOR_EXPIRED is not used here",
             "content": {
               "application/json": {
                 "schema": {
@@ -1899,30 +1967,8 @@
           },
           "403": {
             "$ref": "#/components/responses/Forbidden"
-          },
-          "409": {
-            "description": "Run contains a pending relay source",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Error"
-                }
-              }
-            }
           }
-        },
-        "parameters": [
-          {
-            "in": "path",
-            "name": "runID",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "minLength": 1,
-              "maxLength": 128
-            }
-          }
-        ]
+        }
       }
     },
     "/emails/{id}/check": {

@@ -139,8 +139,13 @@ type MailServer struct {
 	deliveryChanged         chan struct{}
 	deliveryWaiters         int
 	deliveryClosed          bool
+	deliveryGraveyard       []graveyardEntry
+	deliveryGraveyardFloor  uint64
+	deliveryWaiterCursors   map[uint64]uint64
+	deliveryWaiterNextID    uint64
 	storageTransactionMutex sync.RWMutex
 	protectedEmailSources   map[string]int
+	runCleanups             *runCleanupRegistry
 	mailDir                 string
 	port                    int
 	host                    string
@@ -213,6 +218,25 @@ type MailServer struct {
 	beforeEmailDelete          func(string) error
 	beforeReadOnlyPublish      func(string)
 	syncAcceptedFenceDirectory func(string) error
+
+	// Deletion-layer hooks are nil in production. They inject failures at
+	// deterministic points of the checkpointed, multi-layer delete.
+	beforeDeletionLayer            func(id, layer string) error
+	beforeDeletionCheckpointRename func(id string) error
+
+	// nowFunc overrides the wall clock for time-based retention logic such as
+	// the delivery graveyard. It is nil in production.
+	nowFunc func() time.Time
+
+	// beforeDeliveryWaitSelect runs under the delivery read lock immediately
+	// before a waiter parks on the change channel. Nil in production; tests use
+	// it to run state changes against a deterministically parked waiter.
+	beforeDeliveryWaitSelect func()
+
+	// duringRunCleanupPin runs while pinning a run cleanup snapshot, under the
+	// store lock and after the matching set is fixed. Nil in production; tests
+	// use it to prove deliveries after the pin stay outside the round.
+	duringRunCleanupPin func(runID string, ids []string)
 
 	// DATA hooks are nil in production and provide deterministic synchronization
 	// for concurrency and shutdown tests.

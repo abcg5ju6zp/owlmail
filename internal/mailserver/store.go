@@ -278,6 +278,10 @@ func (ms *MailServer) AcquireEmailSource(id string) (*Email, func(), error) {
 	if err := validateEmailID(id); err != nil {
 		return nil, nil, fmt.Errorf("invalid email ID: %w", err)
 	}
+	// Callers (HTTP handlers) may pass strings backed by reusable request
+	// buffers. The protection map keeps the string header beyond the
+	// request lifetime, so anchor it in stable storage.
+	id = strings.Clone(id)
 	ms.storageTransactionMutex.Lock()
 	ms.storeMutex.RLock()
 	email, exists := ms.storeByID[id]
@@ -346,6 +350,17 @@ func (ms *MailServer) GetAllEmail() []*Email {
 
 // DeleteEmail deletes an email by ID
 func (ms *MailServer) DeleteEmail(id string) error {
+	return ms.deleteEmailInternal(id, true)
+}
+
+// DeleteEmailQuiet deletes an email without broadcasting a delete event.
+// Restart takeover of an unfinished run cleanup uses it so a pre-crash
+// deletion never reaches listeners as a brand-new event.
+func (ms *MailServer) DeleteEmailQuiet(id string) error {
+	return ms.deleteEmailInternal(id, false)
+}
+
+func (ms *MailServer) deleteEmailInternal(id string, emitEvent bool) error {
 	// Validate email ID to prevent path traversal
 	if err := validateEmailID(id); err != nil {
 		return fmt.Errorf("invalid email ID: %w", err)
@@ -384,9 +399,11 @@ func (ms *MailServer) DeleteEmail(id string) error {
 
 	common.Log("Deleting email - %s, id: %s", email.Subject, email.ID)
 
-	// Emit delete event
-	if err := ms.emit("delete", email); err != nil {
-		common.Error("Failed to emit delete event: %v", err)
+	if emitEvent {
+		// Emit delete event
+		if err := ms.emit("delete", email); err != nil {
+			common.Error("Failed to emit delete event: %v", err)
+		}
 	}
 
 	return nil
@@ -419,7 +436,7 @@ func (ms *MailServer) DeleteAllEmail() error {
 			deletionErrors = append(deletionErrors, fmt.Errorf("delete %s: %w", id, err))
 			continue
 		}
-		ms.deleteEmailFromRuntimeState(id)
+		ms.deleteEmailRuntimeState(id, false)
 		ms.deletedMessages.Add(1)
 	}
 	if err := errors.Join(deletionErrors...); err != nil {
@@ -432,7 +449,15 @@ func (ms *MailServer) DeleteAllEmail() error {
 	ms.receivedAtByID = make(map[string]time.Time)
 	ms.storePositionByID = make(map[string]int)
 	ms.nextStorePosition = 0
+	// A global clear cannot replay per-message history: drop the graveyard and
+	// expire every cursor at or before the current head.
+	ms.deliveryGraveyard = ms.deliveryGraveyard[:0]
+	ms.invalidateDeliveriesBeforeLocked(ms.deliverySequence)
+	ms.notifyDeliveryChangedLocked()
 	ms.storeMutex.Unlock()
+	// Active snapshots describe emails the clear just removed; their durable
+	// files reconcile to "confirmed deleted" on the next startup.
+	ms.runCleanups.reset()
 	ms.clearMailboxIndex()
 
 	// Clear mail directory
@@ -459,7 +484,7 @@ func (ms *MailServer) DeleteAllEmail() error {
 					continue
 				}
 				for _, metadataEntry := range metadataEntries {
-					if metadataEntry.IsDir() && (metadataEntry.Name() == relayJobMetadataDirectoryName || metadataEntry.Name() == "webhook-history") {
+					if metadataEntry.IsDir() && (metadataEntry.Name() == relayJobMetadataDirectoryName || metadataEntry.Name() == "webhook-history" || metadataEntry.Name() == runCleanupDirectory) {
 						continue
 					}
 					metadataPath := filepath.Join(path, metadataEntry.Name())
@@ -948,6 +973,9 @@ func (ms *MailServer) LoadMailsFromDirectory() error {
 		common.Error("Storage recovery completed with errors: %v", err)
 		loadErrors = append(loadErrors, err)
 	}
+	// Register unfinished run cleanup snapshots without executing them;
+	// explicit ResumeRunCleanups owns takeover after the API is wired.
+	loadErrors = append(loadErrors, ms.loadParkedRunCleanups()...)
 	files, err := os.ReadDir(ms.mailDir)
 	if err != nil {
 		return fmt.Errorf("failed to read mail directory: %w", err)

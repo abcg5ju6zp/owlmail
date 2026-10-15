@@ -18,6 +18,7 @@ const (
 	ErrorCodePortOutOfRange      = "PORT_OUT_OF_RANGE"
 	ErrorCodeInvalidPort         = "INVALID_PORT"
 	ErrorCodeConfigUpdateFailed  = "CONFIG_UPDATE_FAILED"
+	ErrorCodeCursorExpired       = "CURSOR_EXPIRED"
 
 	// Relay errors
 	ErrorCodeRelayFailed = "RELAY_FAILED"

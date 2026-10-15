@@ -69,12 +69,17 @@ expired. Prefer bounded retry with a short interval over a fixed sleep.
 4. Check `timed_out` and `emails`; a timeout is a normal HTTP 200 response.
    `count` is an at-least threshold, not an exactly-once assertion.
 5. Use `POST /api/v1/emails/:id/check` or inspect the detached detail.
-6. Clean up with `DELETE /api/v1/test-runs/:runID/emails` after assertions;
-   inspect the `failed` array and `more_possible` before considering it done.
+6. Clean up with `DELETE /api/v1/test-runs/:runID/emails` after assertions.
+   The pinned snapshot is fixed for the round: follow `next_cursor` while
+   `more_possible` is true, and inspect `failures` (each with `id` and
+   `reason`) and the `failed` count before considering it done. Blocked
+   members keep their source and can be cleaned by a later round.
 
-Cursors expire on process restart. Test-run IDs are selectors, not tenant
-authorization. The [delivery wait contract](./Delivery-Waits-and-Test-Runs.md)
-defines count limits, quotas, pending Relay protection, and bounded cleanup.
+Cursors expire on process restart and can return `CURSOR_EXPIRED` when their
+replay window was reclaimed; take a fresh cursor then. Test-run IDs are
+selectors, not tenant authorization. The [delivery wait
+contract](./Delivery-Waits-and-Test-Runs.md) defines count limits, quotas,
+pending Relay protection, and snapshot cleanup.
 The [README example](../../README.md#wait-check-and-clean-up-in-ci) shows a
 complete stable-release test with Python's standard library.
 

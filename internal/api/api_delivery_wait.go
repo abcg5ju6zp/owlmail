@@ -2,9 +2,11 @@ package api
 
 import (
 	"errors"
+	"strconv"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/soulteary/owlmail/internal/common"
 	"github.com/soulteary/owlmail/internal/mailserver"
 )
 
@@ -33,6 +35,7 @@ func (api *API) waitDeliveries(c fiber.Ctx) error {
 	result, err := api.mailServer.WaitDeliveries(c.Context(), input.After, input.DeliveryFilter, input.Count, time.Duration(input.TimeoutSeconds)*time.Second)
 	if err != nil {
 		status := 400
+		code := ErrorCodeInvalidRequest
 		if errors.Is(err, mailserver.ErrWaitCapacity) {
 			status = 429
 			c.Set("Retry-After", "1")
@@ -40,37 +43,82 @@ func (api *API) waitDeliveries(c fiber.Ctx) error {
 		if errors.Is(err, mailserver.ErrMailboxClosed) {
 			status = 503
 		}
-		return c.Status(status).JSON(ErrorResponse(ErrorCodeInvalidRequest, err.Error()))
+		if errors.Is(err, mailserver.ErrCursorExpired) {
+			code = ErrorCodeCursorExpired
+		}
+		return c.Status(status).JSON(ErrorResponse(code, err.Error()))
 	}
 	return c.JSON(result)
 }
+
+// protectRunCleanupSource combines the relay-queue ownership check with the
+// mailserver delete. A queued relay is reported with the domain sentinel so
+// run cleanup records it as relay_pending instead of failing the whole page.
+func (api *API) protectRunCleanupSource(id string, delete func(string) error) error {
+	err := api.relayJobs.protectSourceDeletion([]string{id}, func() error {
+		return delete(id)
+	})
+	if errors.Is(err, errRelaySourceInUse) {
+		return mailserver.ErrRunEmailRelayPending
+	}
+	return err
+}
+
+// runCleanupDeleteOne is the per-member deleter for interactive cleanup pages.
+func (api *API) runCleanupDeleteOne(id string) error {
+	return api.protectRunCleanupSource(id, api.mailServer.DeleteEmail)
+}
+
+// runCleanupResumeDeleteOne is the per-member deleter for startup takeover;
+// it suppresses delete events so pre-crash deletions are not rebroadcast.
+func (api *API) runCleanupResumeDeleteOne(id string) error {
+	return api.protectRunCleanupSource(id, api.mailServer.DeleteEmailQuiet)
+}
+
+// resumeRunCleanups takes over unfinished snapshots after startup. Failures are
+// logged but never block serving: snapshots stay parked for the next attempt.
+func (api *API) resumeRunCleanups() {
+	results, err := api.mailServer.ResumeRunCleanups(api.runCleanupResumeDeleteOne)
+	if err != nil {
+		common.Error("Run cleanup takeover completed with errors: %v", err)
+	}
+	for _, result := range results {
+		common.Log("Run cleanup takeover for %s: %d deleted, %d failed, more_possible=%t",
+			result.RunID, len(result.Deleted), result.Failed, result.MorePossible)
+	}
+}
+
 func (api *API) deleteTestRunEmails(c fiber.Ctx) error {
 	runID := c.Params("runID")
 	if err := mailserver.ValidateRunID(runID); err != nil || runID == "" {
 		return c.Status(400).JSON(ErrorResponse(ErrorCodeInvalidRequest, "Invalid run_id"))
 	}
-	emails, total := api.mailServer.QueryEmails(mailserver.EmailQuery{Limit: 1000, MatchStoreEmail: mailserver.DeliveryFilter{RunID: runID}.Matches})
-	ids := make([]string, 0, len(emails))
-	for _, e := range emails {
-		ids = append(ids, e.ID)
-	}
-	deleted := make([]string, 0, len(ids))
-	failed := make([]string, 0)
-	// A nil/empty ID list means all sources to the protection helper; avoid it for an empty run.
-	if len(ids) > 0 {
-		err := api.relayJobs.protectSourceDeletion(ids, func() error {
-			for _, id := range ids {
-				if err := api.mailServer.DeleteEmail(id); err != nil {
-					failed = append(failed, id)
-				} else {
-					deleted = append(deleted, id)
-				}
-			}
-			return nil
-		})
-		if err != nil {
-			return c.Status(409).JSON(ErrorResponse(ErrorCodeRelayFailed, "Run contains a pending relay source"))
+	limit := mailserver.RunCleanupDefaultLimit
+	if raw := c.Query("limit"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 1 || parsed > mailserver.RunCleanupMaxLimit {
+			return c.Status(400).JSON(ErrorResponse(ErrorCodeInvalidRequest, "limit must be an integer between 1 and 1000"))
 		}
+		limit = parsed
 	}
-	return c.JSON(fiber.Map{"run_id": runID, "deleted": deleted, "failed": failed, "more_possible": total > len(ids)})
+	result, err := api.mailServer.CleanupTestRun(mailserver.RunCleanupRequest{
+		RunID:  runID,
+		Cursor: c.Query("cursor"),
+		Limit:  limit,
+	}, api.runCleanupDeleteOne)
+	if err != nil {
+		if errors.Is(err, mailserver.ErrRunCleanupInvalidCursor) {
+			return c.Status(400).JSON(ErrorResponse(ErrorCodeInvalidRequest, err.Error()))
+		}
+		// Snapshot persistence or other server-side failures: request
+		// parameters were already validated above.
+		return c.Status(500).JSON(ErrorResponse(ErrorCodeInvalidRequest, err.Error()))
+	}
+	if result.Failures == nil {
+		result.Failures = []mailserver.RunCleanupFailure{}
+	}
+	if result.Deleted == nil {
+		result.Deleted = []string{}
+	}
+	return c.JSON(result)
 }

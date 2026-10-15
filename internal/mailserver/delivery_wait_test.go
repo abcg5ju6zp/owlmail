@@ -109,15 +109,21 @@ func TestCursorCountDeletionAndCapacity(t *testing.T) {
 	if err := s.DeleteAllEmail(); err != nil {
 		t.Fatal(err)
 	}
+	// A global clear permanently holes the replay window: cursors at or before
+	// the clear head expire instead of silently missing deleted messages.
+	if _, err := s.WaitDeliveries(context.Background(), cursor, DeliveryFilter{}, 1, time.Millisecond); !errors.Is(err, ErrCursorExpired) {
+		t.Fatalf("cursor after delete-all: %v", err)
+	}
+	fresh := s.DeliveryCursor()
 	commitTestDelivery(t, s, "second", "run-a", "a@example.test")
-	result, err = s.WaitDeliveries(context.Background(), cursor, DeliveryFilter{}, 1, time.Second)
+	result, err = s.WaitDeliveries(context.Background(), fresh, DeliveryFilter{}, 1, time.Second)
 	if err != nil || result.Emails[0].ID != "second" {
 		t.Fatalf("post-delete %+v %v", result, err)
 	}
 	s.storeMutex.Lock()
 	s.deliveryWaiters = 64
 	s.storeMutex.Unlock()
-	if _, err := s.WaitDeliveries(context.Background(), cursor, DeliveryFilter{}, 1, time.Second); !errors.Is(err, ErrWaitCapacity) {
+	if _, err := s.WaitDeliveries(context.Background(), fresh, DeliveryFilter{}, 1, time.Second); !errors.Is(err, ErrWaitCapacity) {
 		t.Fatal(err)
 	}
 	s.storeMutex.Lock()

@@ -515,15 +515,20 @@ For the broader comparison, see the
 
 - `GET /api/v1/emails/cursor` returns a process-scoped committed delivery cursor.
 - `POST /api/v1/emails/wait` replays retained mail after that cursor and waits
-  for a bounded number of matching deliveries.
-- `DELETE /api/v1/test-runs/:runID/emails` deletes a bounded snapshot belonging
-  to one test run, preserving pending relay sources.
+  for a bounded number of matching deliveries. Wait cursors whose replay window
+  was reclaimed receive 400 with error code `CURSOR_EXPIRED`; take a fresh cursor.
+- `DELETE /api/v1/test-runs/:runID/emails` pins one fixed snapshot of the run
+  (page size `limit`, 1..1000, default 1000) and deletes exactly that set across
+  pages. Continue with `next_cursor` while `more_possible` is true; per-email
+  `failures` use `relay_pending`, `source_in_use`, and `storage_unavailable`,
+  and blocked sources are preserved. Invalid or stale cursors return 400.
 
 Native lists, previews, and exports accept exact `run_id` and `recipient` query
 selectors. Send `X-OwlMail-Run-ID` to group captured messages. These selectors
 are test organization, not authentication or tenant isolation. See the
 [delivery wait contract](../en/Delivery-Waits-and-Test-Runs.md) for cursor
-expiry, timeout results, quotas, and cleanup semantics.
+expiry (including the 150-second deletion graveyard), timeout results, quotas,
+and snapshot cleanup semantics.
 
 ## Deterministic email checks
 

@@ -444,12 +444,16 @@ ID 视为不透明字符串。
 
 - `GET /api/v1/emails/cursor` 返回当前进程内已提交投递的 cursor。
 - `POST /api/v1/emails/wait` 回放该 cursor 之后仍保留的邮件，并有界等待匹配投递。
-- `DELETE /api/v1/test-runs/:runID/emails` 删除某次测试运行的有界快照，保留待处理的
-  Relay 源邮件。
+  回放窗口被回收后返回 400，错误码为 `CURSOR_EXPIRED`，需改用新 cursor。
+- `DELETE /api/v1/test-runs/:runID/emails` 在首次调用时固定该 run 的快照集合
+  （`limit` 取 1..1000，默认 1000），只删除快照内成员，并按页推进；`more_possible`
+  为真时用返回的 `next_cursor` 继续。每封失败邮件在 `failures` 中给出原因：
+  `relay_pending`（Relay 仍占用源）、`source_in_use`（下载/读取流持有源）、
+  `storage_unavailable`（存储层失败）；失败邮件的源数据保留。非法或过期 cursor 返回 400。
 
 原生列表、预览与导出支持精确匹配的 `run_id` 和 `recipient` 查询选择器。发送邮件时
 用 `X-OwlMail-Run-ID` 分组。这些选择器只组织测试数据，不提供认证或租户隔离。
-Cursor 失效、超时结果、配额与清理语义见
+Cursor 失效（含单封删除 150 秒的回放墓地）、超时结果、配额与快照清理语义见
 [投递等待契约（English）](../en/Delivery-Waits-and-Test-Runs.md)。
 
 ## 确定性邮件断言

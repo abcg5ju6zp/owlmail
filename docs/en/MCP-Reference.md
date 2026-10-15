@@ -53,9 +53,14 @@ Capture a `cursor` from `list_emails` or `search_emails` before triggering
 application mail. Pass it as `after` to `wait_for_email` with the exact,
 case-sensitive SMTP envelope `recipient` and optional `run_id`. `after` cannot
 be combined with substring `to`. Cursors expire when the mailbox process
-restarts; cursor-based waits also share the mailbox's 64-wait quota. Omitting
-`after` retains the new-delivery-only behavior, so already captured messages
-must be searched instead. See [delivery waits and test runs](./Delivery-Waits-and-Test-Runs.md).
+restarts; cursor-based waits also share the mailbox's 64-wait quota. A wait
+whose replay window was reclaimed fails with the HTTP 400 error code
+`CURSOR_EXPIRED` (surfaced as a tool error over MCP) — capture a new cursor
+instead of retrying. A single email deletion does not invalidate a registered
+wait: the deleted match is still returned from the 150-second replay graveyard
+while the cursor remains valid. Omitting `after` retains the new-delivery-only
+behavior, so already captured messages must be searched instead. See [delivery
+waits and test runs](./Delivery-Waits-and-Test-Runs.md).
 
 `wait_for_email` returns one match: `matched`, `timed_out`,
 `waited_milliseconds`, and an optional singular `email` summary. Successful
