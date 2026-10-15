@@ -188,7 +188,7 @@ func TestReplayAdmissionDoesNotBlockShutdownCancellation(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	queue := &blockedReplayQueue{entered: make(chan struct{})}
+	queue := &blockedReplayQueue{fakeDeliveryQueue: *newFakeDeliveryQueue(), entered: make(chan struct{})}
 	email := testEmail()
 	history := &deliveryHistory{records: map[string]DeliveryRecord{"replay": {ID: "replay", EmailID: email.ID, Status: "failed", CompletedAt: time.Now(), Outcomes: []DeliveryOutcome{{Target: "failed", ErrorCategory: "transport"}}}}}
 	service := &Service{dispatcher: dispatcher, queue: queue, history: history, ctx: ctx, cancel: cancel, accepting: true, shutdownTimeout: 20 * time.Millisecond}

@@ -58,15 +58,15 @@ export OWLMAIL_WEBHOOK_SHUTDOWN_TIMEOUT=15s
 
 ## 选择可运行示例
 
-| 场景 | 配置 |
-|---|---|
-| 使用默认请求体转发所有新邮件 | [`examples/webhooks/minimal.json`](../../examples/webhooks/minimal.json) |
-| 按收件人和主题过滤 | [`examples/webhooks/filtered-alerts.json`](../../examples/webhooks/filtered-alerts.json) |
-| 带鉴权的自定义 JSON 和 HMAC | [`examples/webhooks/custom-json.json`](../../examples/webhooks/custom-json.json) |
-| 全量归档与事故目标多路分发 | [`examples/webhooks/multiple-targets.json`](../../examples/webhooks/multiple-targets.json) |
-| 纯文本请求体 | [`examples/webhooks/plain-text.json`](../../examples/webhooks/plain-text.json) |
-| 完整 OwlMail + `soulteary/webhook` Compose 联动 | [`examples/webhooks/soulteary-webhook/`](../../examples/webhooks/soulteary-webhook/) |
-| 单个目标展示大部分参数 | [`examples/webhooks.json`](../../examples/webhooks.json) |
+| 场景                                            | 配置                                                                                       |
+| ----------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| 使用默认请求体转发所有新邮件                    | [`examples/webhooks/minimal.json`](../../examples/webhooks/minimal.json)                   |
+| 按收件人和主题过滤                              | [`examples/webhooks/filtered-alerts.json`](../../examples/webhooks/filtered-alerts.json)   |
+| 带鉴权的自定义 JSON 和 HMAC                     | [`examples/webhooks/custom-json.json`](../../examples/webhooks/custom-json.json)           |
+| 全量归档与事故目标多路分发                      | [`examples/webhooks/multiple-targets.json`](../../examples/webhooks/multiple-targets.json) |
+| 纯文本请求体                                    | [`examples/webhooks/plain-text.json`](../../examples/webhooks/plain-text.json)             |
+| 完整 OwlMail + `soulteary/webhook` Compose 联动 | [`examples/webhooks/soulteary-webhook/`](../../examples/webhooks/soulteary-webhook/)       |
+| 单个目标展示大部分参数                          | [`examples/webhooks.json`](../../examples/webhooks.json)                                   |
 
 [示例操作指南](../../examples/webhooks/README.zh-CN.md)包含仅监听本机的接收器、
 完整启动命令和测试 SMTP 邮件。
@@ -100,20 +100,20 @@ export OWLMAIL_WEBHOOK_SHUTDOWN_TIMEOUT=15s
 }
 ```
 
-| 字段 | 必需 | 行为 |
-|---|---:|---|
-| `version` | 否 | 配置版本；省略或设置为 `1` 都表示版本 1。 |
-| `targets` | 是 | 1～32 个目标，目标名称必须唯一。 |
-| `name` | 是 | 仅用于日志的安全标识，最长 100 个 UTF-8 字节且不能包含换行；完整 URL 和配置密钥不会写入日志。 |
-| `url` | 是 | 固定的 `http` 或 `https` 地址；拒绝用户信息和片段，不会跟随重定向。 |
-| `method` | 否 | 默认 `POST`，支持 `POST`、`PUT`、`PATCH`。 |
-| `headers` | 否 | 静态请求头；名称和值会被校验，不能覆盖 `Host` 和 `Content-Length`。 |
-| `contentType` | 否 | 默认 `application/json`；显式 `Content-Type` 请求头优先。 |
-| `secret` | 否 | 生成防重放的 `X-OwlMail-Signature-V2`，同时保留旧版仅正文签名。 |
-| `timeout` | 否 | 每次请求的超时，默认 `5s`，最大 `1m`。 |
-| `retries` | 否 | 0～5 次额外尝试；仅网络错误、408、425、429 和 5xx 会重试。 |
-| `match` | 否 | 不区分大小写的通配符规则，语义见下文。 |
-| `bodyTemplate` | 否 | 自定义请求体的 Go 文本模板；省略时发送默认事件结构。 |
+| 字段           | 必需 | 行为                                                                                          |
+| -------------- | ---: | --------------------------------------------------------------------------------------------- |
+| `version`      |   否 | 配置版本；省略或设置为 `1` 都表示版本 1。                                                     |
+| `targets`      |   是 | 1～32 个目标，目标名称必须唯一。                                                              |
+| `name`         |   是 | 仅用于日志的安全标识，最长 100 个 UTF-8 字节且不能包含换行；完整 URL 和配置密钥不会写入日志。 |
+| `url`          |   是 | 固定的 `http` 或 `https` 地址；拒绝用户信息和片段，不会跟随重定向。                           |
+| `method`       |   否 | 默认 `POST`，支持 `POST`、`PUT`、`PATCH`。                                                    |
+| `headers`      |   否 | 静态请求头；名称和值会被校验，不能覆盖 `Host` 和 `Content-Length`。                           |
+| `contentType`  |   否 | 默认 `application/json`；显式 `Content-Type` 请求头优先。                                     |
+| `secret`       |   否 | 生成防重放的 `X-OwlMail-Signature-V2`，同时保留旧版仅正文签名。                               |
+| `timeout`      |   否 | 每次请求的超时，默认 `5s`，最大 `1m`。                                                        |
+| `retries`      |   否 | 0～5 次额外尝试；仅网络错误、408、425、429 和 5xx 会重试。                                    |
+| `match`        |   否 | 不区分大小写的通配符规则，语义见下文。                                                        |
+| `bodyTemplate` |   否 | 自定义请求体的 Go 文本模板；省略时发送默认事件结构。                                          |
 
 `url`、请求头值和 `secret` 支持 `${VARIABLE}` 占位符。如果变量不存在或值为空，OwlMail 会在启动阶段报错，不会静默发送缺少鉴权信息的请求。
 
@@ -136,19 +136,36 @@ export OWLMAIL_WEBHOOK_SHUTDOWN_TIMEOUT=15s
 成功才删除本地文件；队列临时失败时，outbox 条目会保留并重试。需要跨重启恢复时，
 必须配置持久化的 `-mail-directory`，因为默认的进程专属临时目录不会被下个进程复用。
 
-设置 `OWLMAIL_WEBHOOK_REDIS_URL` 后，consumer group worker 仅在所有匹配目标成功后
-确认并删除 Stream 条目；进程崩溃遗留的 pending 条目会在 30 秒后被重新认领。目标
-耗尽自身重试后，包含投递错误的记录会写入 `<prefix>:dead-letter`，随后移除活动条目。
-Redis 必须在启动时可访问；启动后的 Redis 故障由本地 outbox 暂存，直到交接成功。
+设置 `OWLMAIL_WEBHOOK_REDIS_URL` 后，投递过程由稳定身份串联成可恢复阶段。邮件
+交接身份即 outbox 文件中保存的队列任务 ID，Redis 为其保存交接标记
+（`<prefix>:handoff:<job-id>`）。即使 `XADD` 响应丢失，worker 也会按该身份核对
+原任务而不是重复追加，本地 outbox 文件只有在标记确认交接后才删除。
 
-该语义是“至少一次”：若接收端已经成功、但进程在确认 Redis 前崩溃，重启后会
+每个 target 还拥有稳定的独立投递身份和阶段（`pending`、`retry`、`succeeded`、
+`failed`），保存在 `<prefix>:deliveries:<job-id>`。每次认领都会在
+`<prefix>:lease:<stream-id>` 写入随机的认领代际围栏令牌，并由租约心跳续约。租约
+（空闲 30 秒）被重新认领后，失去租约的 worker 无法再写入结果或完成任务；下一次
+认领只会向没有终态阶段的目标发送 HTTP：已成功的目标不会重发，单个失败目标也不会
+阻塞其他目标。
+
+只有当每个匹配目标都进入终态后，consumer group worker 才确认并删除 Stream 条目。
+可重试结果（网络错误、408、425、429、5xx）会让条目保持 pending，由下一次认领继续
+尝试；永久失败结果会把目标标记为 `failed`，把包含投递错误的记录追加到
+`<prefix>:dead-letter`，并允许任务在其他目标完成后正常终结。永久失败同时可在可查询
+的投递历史中查看。Redis 必须在启动时可访问；启动后的 Redis 故障由本地 outbox
+暂存，直到交接成功。
+
+该语义是“至少一次”：若接收端已经成功、但目标阶段尚未写入时进程崩溃，重启后会
 重复投递。接收端应使用稳定的 `X-OwlMail-Delivery-ID` 去重；仅使用邮件 ID 无法
 区分同一邮件未来可能产生的多个事件。当前 consumer 配置面向每个前缀单个活动
 OwlMail 实例。
 
 退出时会先停止 SMTP 入口和新的队列交接，在 `-webhook-shutdown-timeout` 内排空
-outbox、排队任务及执行中的投递，超时后再取消共享上下文。未配置 Redis 时，本地
-文件只覆盖内存队列接收前的故障；条目转入内存队列后不再具备跨重启恢复能力。
+outbox 与排队任务，并让执行中的投递要么完成、要么释放租约（Stream 条目保持
+pending），超时后再取消共享上下文。重启后的进程以相同前缀加入同一个 Stream、
+consumer group 与逐目标状态，并在重新认领窗口后接管上一代际遗留的 pending 条目。
+未配置 Redis 时，本地文件只覆盖内存队列接收前的故障；条目转入内存队列后不再具备
+跨重启恢复能力。
 
 ## 并发与背压
 
@@ -192,15 +209,15 @@ SMTP `DATA` 命令只等待本地 outbox 同步提交，不等待 Redis append�
 
 模板可使用以下字段：
 
-| 字段 | 类型 | 说明 |
-|---|---|---|
-| `.ID`、`.Subject`、`.Text`、`.HTML` | 字符串 | 邮件标识和内容。 |
-| `.Time` | 时间 | 邮件头时间或接收时间。 |
-| `.From`、`.To`、`.CC`、`.BCC` | 字符串数组 | 不带显示名称的解析后地址。 |
-| `.EnvelopeFrom`、`.EnvelopeTo` | 字符串 / 字符串数组 | SMTP 信封地址。 |
-| `.Size`、`.SizeHuman` | 数值 / 字符串 | 已保存邮件的大小。 |
-| `.Attachments`、`.AttachmentCount` | 数组 / 数值 | 安全的附件元数据；不暴露附件正文和本地路径。 |
-| `.Headers` | 映射 | 解析后的邮件头，仅在显式模板中可用。 |
+| 字段                                | 类型                | 说明                                         |
+| ----------------------------------- | ------------------- | -------------------------------------------- |
+| `.ID`、`.Subject`、`.Text`、`.HTML` | 字符串              | 邮件标识和内容。                             |
+| `.Time`                             | 时间                | 邮件头时间或接收时间。                       |
+| `.From`、`.To`、`.CC`、`.BCC`       | 字符串数组          | 不带显示名称的解析后地址。                   |
+| `.EnvelopeFrom`、`.EnvelopeTo`      | 字符串 / 字符串数组 | SMTP 信封地址。                              |
+| `.Size`、`.SizeHuman`               | 数值 / 字符串       | 已保存邮件的大小。                           |
+| `.Attachments`、`.AttachmentCount`  | 数组 / 数值         | 安全的附件元数据；不暴露附件正文和本地路径。 |
+| `.Headers`                          | 映射                | 解析后的邮件头，仅在显式模板中可用。         |
 
 模板函数：
 
@@ -254,17 +271,17 @@ SMTP `DATA` 命令只等待本地 outbox 同步提交，不等待 Redis append�
 
 ## 请求头
 
-| 请求头 | 值 |
-|---|---|
-| `Content-Type` | 目标的 `contentType`，默认为 `application/json`；显式自定义请求头优先。 |
-| `User-Agent` | 默认为 `OwlMail-Webhook/1`，可用自定义请求头覆盖。 |
-| `X-OwlMail-Event` | 固定为 `email.received`。 |
-| `X-OwlMail-Email-ID` | OwlMail 邮件 ID。 |
-| `X-OwlMail-Delivery-ID` | 稳定的队列任务 ID，接收端应以此作为幂等键。 |
-| `X-OwlMail-Timestamp` | 配置 `secret` 时发送的 UTC RFC 3339 签名时间。 |
-| `X-OwlMail-Nonce` | 每次 HTTP 尝试使用的新随机值。 |
+| 请求头                   | 值                                                                                                                             |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------ |
+| `Content-Type`           | 目标的 `contentType`，默认为 `application/json`；显式自定义请求头优先。                                                        |
+| `User-Agent`             | 默认为 `OwlMail-Webhook/1`，可用自定义请求头覆盖。                                                                             |
+| `X-OwlMail-Event`        | 固定为 `email.received`。                                                                                                      |
+| `X-OwlMail-Email-ID`     | OwlMail 邮件 ID。                                                                                                              |
+| `X-OwlMail-Delivery-ID`  | 稳定的队列任务 ID，接收端应以此作为幂等键。                                                                                    |
+| `X-OwlMail-Timestamp`    | 配置 `secret` 时发送的 UTC RFC 3339 签名时间。                                                                                 |
+| `X-OwlMail-Nonce`        | 每次 HTTP 尝试使用的新随机值。                                                                                                 |
 | `X-OwlMail-Signature-V2` | `v2=` 加上对 `timestamp + "." + nonce + "." + 原始请求体` 计算的 HMAC-SHA256。接收端应要求此头、限制时间窗口并拒绝重复 nonce。 |
-| `X-OwlMail-Signature` | 为兼容旧接收端保留的仅正文签名，不具备防重放能力。 |
+| `X-OwlMail-Signature`    | 为兼容旧接收端保留的仅正文签名，不具备防重放能力。                                                                             |
 
 重试使用相同请求体和 delivery ID，但每次生成新的时间戳与 nonce。
 
@@ -338,9 +355,11 @@ Hook 文件使用 `getenv` 时，需要用 `-template` 参数启动 `soulteary/w
    100 ms、200 ms、400 ms、800 ms、1.6 s 后重试；不会解析 `Retry-After`；
 5. 其他 3xx/4xx 会立即失败，响应正文不会参与处理。
 
-Redis 模式提供持久化投递队列、重启恢复与死信 Stream。未配置 Redis 时，本地
-outbox 仅持久化到内存队列接收任务为止；重试耗尽的任务会记录错误，重启后不会
-重放。关闭时会在配置的期限内排空已接收任务，详见
+Redis 模式提供持久化投递队列、逐目标重启恢复，以及面向永久失败目标的死信
+Stream。可重试结果会保留任务并在下一次认领时继续尝试；已成功的目标会被跳过，
+永久失败目标形成可查询终态且不阻塞其他目标。未配置 Redis 时，本地 outbox 仅
+持久化到内存队列接收任务为止；重试耗尽的任务会记录错误，重启后不会重放。关闭时
+会在配置的期限内排空已接收任务，详见
 [关闭与投递保证](./Operations.md#关闭与投递保证)。
 
 本地检查时，可在不同终端运行内置接收器和最小配置：

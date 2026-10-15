@@ -3,6 +3,7 @@ package webhook
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -107,24 +109,95 @@ func TestServiceCloseDrainsInFlightDelivery(t *testing.T) {
 type fakeDeliveryQueue struct {
 	claims     chan *queueReceipt
 	mu         sync.Mutex
-	acked      []string
-	dead       []string
+	markers    map[string]string // handoff job ID -> stream ID or "done"
+	stream     map[string]deliveryJob
+	owners     map[string]string // stream ID -> current consumer
+	tokens     map[string]string // stream ID -> current fencing token
+	states     map[string]map[string]targetState
+	dead       []deadLetterRecord
 	renewed    []string
-	count      int64
 	enqueueErr error
+	uncertain  bool
+	nextID     int
 }
 
+func newFakeDeliveryQueue() *fakeDeliveryQueue {
+	return &fakeDeliveryQueue{
+		claims:  make(chan *queueReceipt, 4),
+		markers: make(map[string]string),
+		stream:  make(map[string]deliveryJob),
+		owners:  make(map[string]string),
+		tokens:  make(map[string]string),
+		states:  make(map[string]map[string]targetState),
+	}
+}
+
+// Enqueue mirrors the Redis handoff marker: a repeated call for the same job
+// ID reconciles against the existing entry instead of duplicating it.
 func (queue *fakeDeliveryQueue) Enqueue(_ context.Context, job deliveryJob) error {
 	queue.mu.Lock()
-	if queue.enqueueErr != nil {
+	if queue.enqueueErr != nil && !queue.uncertain {
 		err := queue.enqueueErr
 		queue.mu.Unlock()
 		return err
 	}
-	queue.count++
+	err := queue.enqueueErr
+	uncertain := queue.uncertain
+	if marker, exists := queue.markers[job.ID]; exists {
+		if existing, ok := queue.stream[marker]; ok && marker != redisHandoffDone && existing.ID != job.ID {
+			queue.mu.Unlock()
+			return fmt.Errorf("handoff identity mismatch for %s", job.ID)
+		}
+		queue.mu.Unlock()
+		return err
+	}
+	queue.nextID++
+	id := fmt.Sprintf("fake-%d", queue.nextID)
+	queue.stream[id] = job
+	queue.markers[job.ID] = id
+	queue.owners[id] = "test-consumer"
+	queue.tokens[id] = "token-" + id
+	receipt := &queueReceipt{id: id, token: "token-" + id, job: job}
 	queue.mu.Unlock()
-	queue.claims <- &queueReceipt{id: job.ID, job: job}
-	return nil
+	if uncertain && err == nil {
+		err = errors.New("simulated lost enqueue response")
+	}
+	if err == nil {
+		queue.claims <- receipt
+	}
+	return err
+}
+
+func (queue *fakeDeliveryQueue) streamEntry(id string) (deliveryJob, bool) {
+	queue.mu.Lock()
+	defer queue.mu.Unlock()
+	job, ok := queue.stream[id]
+	return job, ok
+}
+
+func (queue *fakeDeliveryQueue) stealLease(id string) {
+	queue.mu.Lock()
+	defer queue.mu.Unlock()
+	queue.owners[id] = "other-consumer"
+	queue.tokens[id] = "stolen-token"
+}
+
+func (queue *fakeDeliveryQueue) snapshot() (map[string]string, map[string]map[string]targetState, []deadLetterRecord) {
+	queue.mu.Lock()
+	defer queue.mu.Unlock()
+	markers := make(map[string]string, len(queue.markers))
+	for key, value := range queue.markers {
+		markers[key] = value
+	}
+	states := make(map[string]map[string]targetState, len(queue.states))
+	for key, value := range queue.states {
+		copied := make(map[string]targetState, len(value))
+		for target, state := range value {
+			copied[target] = state
+		}
+		states[key] = copied
+	}
+	return markers, states, append([]deadLetterRecord(nil), queue.dead...)
 }
 
 func TestOutboxRetainsJobUntilQueueAcceptsIt(t *testing.T) {
@@ -139,7 +212,8 @@ func TestOutboxRetainsJobUntilQueueAcceptsIt(t *testing.T) {
 	if err := outbox.Commit(job.Email.ID); err != nil {
 		t.Fatal(err)
 	}
-	queue := &fakeDeliveryQueue{claims: make(chan *queueReceipt, 1), enqueueErr: errors.New("redis unavailable")}
+	queue := newFakeDeliveryQueue()
+	queue.enqueueErr = errors.New("redis unavailable")
 	service := &Service{queue: queue, outbox: outbox, ctx: context.Background()}
 
 	if pending, err := service.flushOutbox(); err == nil || !pending {
@@ -636,6 +710,15 @@ func TestOutboxCloseSignalFlushesAcceptedEntries(t *testing.T) {
 func (queue *fakeDeliveryQueue) Claim(ctx context.Context) (*queueReceipt, error) {
 	select {
 	case receipt := <-queue.claims:
+		queue.mu.Lock()
+		if receipt.token != "" {
+			queue.tokens[receipt.id] = receipt.token
+			queue.owners[receipt.id] = "test-consumer"
+		}
+		if _, exists := queue.stream[receipt.id]; !exists {
+			queue.stream[receipt.id] = receipt.job
+		}
+		queue.mu.Unlock()
 		return receipt, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -644,73 +727,379 @@ func (queue *fakeDeliveryQueue) Claim(ctx context.Context) (*queueReceipt, error
 	}
 }
 
-func (queue *fakeDeliveryQueue) Ack(_ context.Context, receipt *queueReceipt) error {
-	queue.mu.Lock()
-	defer queue.mu.Unlock()
-	queue.acked = append(queue.acked, receipt.id)
-	queue.count--
-	return nil
-}
-
-func (queue *fakeDeliveryQueue) DeadLetter(_ context.Context, receipt *queueReceipt, _ []Result) error {
-	queue.mu.Lock()
-	defer queue.mu.Unlock()
-	queue.dead = append(queue.dead, receipt.id)
-	queue.count--
-	return nil
-}
-
 func (queue *fakeDeliveryQueue) Renew(_ context.Context, receipt *queueReceipt) error {
 	queue.mu.Lock()
 	defer queue.mu.Unlock()
+	current, ok := queue.tokens[receipt.id]
+	if !ok || current != receipt.token {
+		return ErrLeaseNotOwned
+	}
 	queue.renewed = append(queue.renewed, receipt.id)
 	return nil
 }
 
-func (queue *fakeDeliveryQueue) Pending(_ context.Context) (int64, error) {
+func (queue *fakeDeliveryQueue) RecordResult(_ context.Context, receipt *queueReceipt, target string, state targetState) (leaseDisposition, error) {
 	queue.mu.Lock()
 	defer queue.mu.Unlock()
-	return queue.count, nil
+	current, tokenExists := queue.tokens[receipt.id]
+	_, owned := queue.owners[receipt.id]
+	if !owned {
+		return leaseFinalized, nil
+	}
+	if !tokenExists || current != receipt.token {
+		return leaseLost, nil
+	}
+	if queue.states[receipt.job.ID] == nil {
+		queue.states[receipt.job.ID] = make(map[string]targetState)
+	}
+	queue.states[receipt.job.ID][target] = state
+	return leaseHeld, nil
+}
+
+func (queue *fakeDeliveryQueue) Finalize(_ context.Context, receipt *queueReceipt, expected []string) (finalizeDisposition, error) {
+	queue.mu.Lock()
+	defer queue.mu.Unlock()
+	if _, owned := queue.owners[receipt.id]; !owned {
+		return finalizeAlreadyDone, nil
+	}
+	if current, ok := queue.tokens[receipt.id]; !ok || current != receipt.token {
+		return finalizeLeaseLost, nil
+	}
+	states := queue.states[receipt.job.ID]
+	wanted := make(map[string]struct{}, len(expected))
+	for _, name := range expected {
+		wanted[name] = struct{}{}
+	}
+	for name := range states {
+		if _, keep := wanted[name]; !keep {
+			delete(states, name)
+		}
+	}
+	for _, name := range expected {
+		state, ok := states[name]
+		if !ok || !state.terminal() {
+			// Retryable or unattempted targets retain the entry; release the
+			// current lease for the next claim generation.
+			delete(queue.tokens, receipt.id)
+			return finalizeRetained, nil
+		}
+	}
+	record := deadLetterRecord{Job: receipt.job, FailedAt: time.Now().UTC()}
+	for _, name := range expected {
+		state := states[name]
+		if state.Stage == targetStageFailed {
+			record.Failures = append(record.Failures, failure{
+				Target: name, StatusCode: state.StatusCode,
+				Attempts: state.Attempts, Error: state.Error,
+			})
+		}
+	}
+	if len(record.Failures) > 0 {
+		queue.dead = append(queue.dead, record)
+	}
+	delete(queue.owners, receipt.id)
+	delete(queue.tokens, receipt.id)
+	delete(queue.stream, receipt.id)
+	queue.markers[receipt.job.ID] = redisHandoffDone
+	return finalizeCompleted, nil
+}
+
+func (queue *fakeDeliveryQueue) TargetStates(_ context.Context, jobID string) (map[string]targetState, error) {
+	queue.mu.Lock()
+	defer queue.mu.Unlock()
+	states := make(map[string]targetState)
+	for target, state := range queue.states[jobID] {
+		states[target] = state
+	}
+	return states, nil
+}
+
+func (queue *fakeDeliveryQueue) ReopenRetry(_ context.Context, job deliveryJob, targets []string) error {
+	queue.mu.Lock()
+	defer queue.mu.Unlock()
+	delete(queue.markers, job.ID)
+	if queue.states[job.ID] == nil {
+		queue.states[job.ID] = make(map[string]targetState)
+	}
+	now := time.Now().UTC()
+	for _, target := range targets {
+		queue.states[job.ID][target] = pendingTargetState(job.ID, target, now)
+	}
+	return nil
+}
+
+func (queue *fakeDeliveryQueue) RecoverTerminal(_ context.Context) ([]terminalHandoff, error) {
+	queue.mu.Lock()
+	defer queue.mu.Unlock()
+	var handoffs []terminalHandoff
+	for jobID, marker := range queue.markers {
+		if marker != redisHandoffDone {
+			continue
+		}
+		states := make(map[string]targetState)
+		for target, state := range queue.states[jobID] {
+			states[target] = state
+		}
+		if len(states) == 0 {
+			continue
+		}
+		handoffs = append(handoffs, terminalHandoff{jobID: jobID, states: states})
+	}
+	return handoffs, nil
 }
 
 func (queue *fakeDeliveryQueue) Close() error { return nil }
 
-func TestDurableServiceDeadLettersExhaustedDelivery(t *testing.T) {
+func newDurableTestService(dispatcher *Dispatcher, queue *fakeDeliveryQueue, leaseRefresh time.Duration, onResults func(string, []Result)) (*Service, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	history, err := newDeliveryHistory("")
+	if err != nil {
+		cancel()
+		panic(err)
+	}
+	service := &Service{
+		dispatcher: dispatcher, queue: queue, history: history, ctx: ctx, cancel: cancel,
+		shutdownTimeout: 5 * time.Second, workerCount: 1, accepting: true,
+		leaseRefresh: leaseRefresh, onResults: onResults,
+	}
+	service.start()
+	return service, cancel
+}
+
+func waitForCondition(t *testing.T, timeout time.Duration, condition func() bool, message string) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		if condition() {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal(message)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+func TestDurableServicePermanentFailureFinalizesWithDeadLetter(t *testing.T) {
+	var hits atomic.Int32
 	receiver := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		hits.Add(1)
 		if request.Header.Get("X-OwlMail-Delivery-ID") != "replayed-job" {
 			t.Errorf("delivery ID = %q", request.Header.Get("X-OwlMail-Delivery-ID"))
 		}
-		writer.WriteHeader(http.StatusServiceUnavailable)
+		writer.WriteHeader(http.StatusBadRequest)
 	}))
 	defer receiver.Close()
 	dispatcher, err := NewDispatcher(Config{Targets: []Target{{Name: "failing", URL: receiver.URL}}}, receiver.Client())
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	queue := &fakeDeliveryQueue{claims: make(chan *queueReceipt, 1), count: 1}
-	queue.claims <- &queueReceipt{id: "redis-entry", job: deliveryJob{ID: "replayed-job", Email: testEmail()}}
-	service := &Service{
-		dispatcher: dispatcher, queue: queue, ctx: ctx, cancel: cancel,
-		shutdownTimeout: time.Second, workerCount: 1, accepting: true,
+	queue := newFakeDeliveryQueue()
+	queue.claims <- &queueReceipt{id: "redis-entry", token: "gen-1", job: deliveryJob{ID: "replayed-job", Email: testEmail()}}
+	service, _ := newDurableTestService(dispatcher, queue, 0, nil)
+	waitForCondition(t, time.Second, func() bool {
+		markers, _, _ := queue.snapshot()
+		return markers["replayed-job"] == redisHandoffDone
+	}, "permanent failure did not finalize the job")
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("permanent target HTTP hits = %d, want 1", got)
 	}
-	service.start()
-	deadline := time.Now().Add(time.Second)
-	for {
-		queue.mu.Lock()
-		dead := append([]string(nil), queue.dead...)
-		queue.mu.Unlock()
-		if len(dead) == 1 {
-			if dead[0] != "redis-entry" {
-				t.Fatalf("dead letter IDs = %v", dead)
+	_, states, dead := queue.snapshot()
+	if len(dead) != 1 || len(dead[0].Failures) != 1 || dead[0].Failures[0].Target != "failing" {
+		t.Fatalf("dead letter = %#v", dead)
+	}
+	if state := states["replayed-job"]["failing"]; state.Stage != targetStageFailed || state.Category != "http_status" {
+		t.Fatalf("permanent target state = %#v", state)
+	}
+	records, _ := service.DeliveryHistory()
+	if len(records) != 1 || records[0].Status != "failed" || len(records[0].Outcomes) != 1 {
+		t.Fatalf("terminal history = %#v", records)
+	}
+	if err := service.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDurableServiceRetryableTargetRetainedForNextClaim(t *testing.T) {
+	var hits atomic.Int32
+	receiver := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		writer.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer receiver.Close()
+	dispatcher, err := NewDispatcher(Config{Targets: []Target{{Name: "retrying", URL: receiver.URL}}}, receiver.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	queue := newFakeDeliveryQueue()
+	job := deliveryJob{ID: "retained-job", Email: testEmail()}
+	queue.claims <- &queueReceipt{id: "redis-entry", token: "gen-1", job: job}
+	queue.claims <- &queueReceipt{id: "redis-entry", token: "gen-2", job: job}
+	service, _ := newDurableTestService(dispatcher, queue, 0, nil)
+	waitForCondition(t, 2*time.Second, func() bool {
+		_, states, _ := queue.snapshot()
+		return states["retained-job"]["retrying"].Attempts == 2
+	}, "retryable target was not redelivered by a later claim")
+	markers, states, dead := queue.snapshot()
+	if _, retained := queue.streamEntry("redis-entry"); !retained {
+		t.Fatalf("retryable job finalized early: %#v", markers)
+	}
+	if len(dead) != 0 {
+		t.Fatalf("retryable target was dead-lettered: %#v", dead)
+	}
+	if state := states["retained-job"]["retrying"]; state.Stage != targetStageRetry {
+		t.Fatalf("retryable target state = %#v", state)
+	}
+	if got := hits.Load(); got != 2 {
+		t.Fatalf("HTTP hits = %d, want 2", got)
+	}
+	// Shutdown releases the retained lease promptly instead of waiting for the
+	// target to recover; the stream entry survives for restart takeover.
+	if err := service.Close(); err != nil {
+		t.Fatal(err)
+	}
+	queue.mu.Lock()
+	defer queue.mu.Unlock()
+	if _, exists := queue.tokens["redis-entry"]; exists {
+		t.Fatal("retained lease fence was not released on shutdown")
+	}
+	if _, exists := queue.stream["redis-entry"]; !exists {
+		t.Fatal("retained entry was removed on shutdown; restart could not take over")
+	}
+}
+
+func TestDurableServiceRecoveryContinuesOnlyRemainingTargets(t *testing.T) {
+	var good, bad atomic.Int32
+	receiver := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/good":
+			good.Add(1)
+			writer.WriteHeader(http.StatusNoContent)
+		case "/bad":
+			if bad.Add(1) == 1 {
+				writer.WriteHeader(http.StatusServiceUnavailable)
+				return
 			}
-			break
+			writer.WriteHeader(http.StatusNoContent)
 		}
-		if time.Now().After(deadline) {
-			t.Fatal("failed job was not dead-lettered")
-		}
-		time.Sleep(5 * time.Millisecond)
+	}))
+	defer receiver.Close()
+	dispatcher, err := NewDispatcher(Config{Targets: []Target{
+		{Name: "good", URL: receiver.URL + "/good"},
+		{Name: "bad", URL: receiver.URL + "/bad"},
+	}}, receiver.Client())
+	if err != nil {
+		t.Fatal(err)
 	}
+	queue := newFakeDeliveryQueue()
+	job := deliveryJob{ID: "multi-job", Email: testEmail()}
+	queue.claims <- &queueReceipt{id: "redis-entry", token: "gen-1", job: job}
+	queue.claims <- &queueReceipt{id: "redis-entry", token: "gen-2", job: job}
+	service, _ := newDurableTestService(dispatcher, queue, 0, nil)
+	waitForCondition(t, 2*time.Second, func() bool {
+		markers, _, _ := queue.snapshot()
+		return markers["multi-job"] == redisHandoffDone
+	}, "recovered claim did not finish the remaining target")
+	if got := good.Load(); got != 1 {
+		t.Fatalf("successful target was redelivered %d times", got)
+	}
+	if got := bad.Load(); got != 2 {
+		t.Fatalf("retryable target HTTP hits = %d, want 2", got)
+	}
+	records, _ := service.DeliveryHistory()
+	if len(records) != 1 || records[0].Status != "succeeded" || len(records[0].Outcomes) != 2 {
+		t.Fatalf("terminal history = %#v", records)
+	}
+	if err := service.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDurableServicePermanentFailureDoesNotBlockSiblingTarget(t *testing.T) {
+	var good atomic.Int32
+	receiver := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/good" {
+			good.Add(1)
+			writer.WriteHeader(http.StatusNoContent)
+			return
+		}
+		writer.WriteHeader(http.StatusBadRequest)
+	}))
+	defer receiver.Close()
+	dispatcher, err := NewDispatcher(Config{Targets: []Target{
+		{Name: "bad", URL: receiver.URL + "/bad"},
+		{Name: "good", URL: receiver.URL + "/good"},
+	}}, receiver.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	queue := newFakeDeliveryQueue()
+	queue.claims <- &queueReceipt{id: "redis-entry", token: "gen-1", job: deliveryJob{ID: "mixed-job", Email: testEmail()}}
+	service, _ := newDurableTestService(dispatcher, queue, 0, nil)
+	waitForCondition(t, time.Second, func() bool {
+		markers, _, _ := queue.snapshot()
+		return markers["mixed-job"] == redisHandoffDone
+	}, "permanent sibling failure blocked job finalization")
+	if got := good.Load(); got != 1 {
+		t.Fatalf("healthy sibling target hits = %d, want 1", got)
+	}
+	_, states, dead := queue.snapshot()
+	if len(dead) != 1 || len(dead[0].Failures) != 1 || dead[0].Failures[0].Target != "bad" {
+		t.Fatalf("dead letter = %#v", dead)
+	}
+	if states["mixed-job"]["good"].Stage != targetStageSucceeded {
+		t.Fatalf("sibling state = %#v", states["mixed-job"])
+	}
+	records, _ := service.DeliveryHistory()
+	if len(records) != 1 || records[0].Status != "failed" || len(records[0].Outcomes) != 2 {
+		t.Fatalf("terminal history = %#v", records)
+	}
+	if err := service.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDurableServiceLeaseLossRejectsLateResults(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	reports := make(chan error, 4)
+	receiver := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		close(started)
+		<-release
+		writer.WriteHeader(http.StatusNoContent)
+	}))
+	defer receiver.Close()
+	dispatcher, err := NewDispatcher(Config{Targets: []Target{{Name: "slow", URL: receiver.URL}}}, receiver.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	queue := newFakeDeliveryQueue()
+	queue.claims <- &queueReceipt{id: "redis-entry", token: "gen-1", job: deliveryJob{ID: "slow-job", Email: testEmail()}}
+	service, _ := newDurableTestService(dispatcher, queue, 5*time.Millisecond, func(_ string, results []Result) {
+		for _, result := range results {
+			if errors.Is(result.Err, ErrLeaseNotOwned) {
+				select {
+				case reports <- result.Err:
+				default:
+				}
+			}
+		}
+	})
+	<-started
+	queue.stealLease("redis-entry")
+	select {
+	case err := <-reports:
+		if !errors.Is(err, ErrLeaseNotOwned) {
+			t.Fatalf("report = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("lease loss was not reported")
+	}
+	waitForCondition(t, time.Second, func() bool {
+		_, states, _ := queue.snapshot()
+		return len(states["slow-job"]) == 0
+	}, "late worker persisted results after losing the lease")
+	close(release)
 	if err := service.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -729,35 +1118,67 @@ func TestDurableServiceRenewsLeaseDuringDelivery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	queue := &fakeDeliveryQueue{claims: make(chan *queueReceipt, 1), count: 1}
-	queue.claims <- &queueReceipt{id: "redis-entry", job: deliveryJob{ID: "slow-job", Email: testEmail()}}
-	service := &Service{
-		dispatcher: dispatcher, queue: queue, ctx: ctx, cancel: cancel,
-		shutdownTimeout: time.Second, workerCount: 1, accepting: true,
-		leaseRefresh: 5 * time.Millisecond,
-	}
-	service.start()
+	queue := newFakeDeliveryQueue()
+	queue.claims <- &queueReceipt{id: "redis-entry", token: "gen-1", job: deliveryJob{ID: "slow-job", Email: testEmail()}}
+	service, _ := newDurableTestService(dispatcher, queue, 5*time.Millisecond, nil)
 	<-started
-	deadline := time.Now().Add(time.Second)
-	for {
+	waitForCondition(t, time.Second, func() bool {
 		queue.mu.Lock()
-		renewed := append([]string(nil), queue.renewed...)
-		queue.mu.Unlock()
-		if len(renewed) > 0 {
-			if renewed[0] != "redis-entry" {
-				t.Fatalf("renewed lease IDs = %v", renewed)
-			}
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("active delivery lease was not renewed")
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
+		defer queue.mu.Unlock()
+		return len(queue.renewed) > 0 && queue.renewed[0] == "redis-entry"
+	}, "active delivery lease was not renewed")
 	close(release)
+	waitForCondition(t, time.Second, func() bool {
+		markers, _, _ := queue.snapshot()
+		return markers["slow-job"] == redisHandoffDone
+	}, "successful delivery did not finalize")
 	if err := service.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestFakeQueueEnqueueReconcilesUncertainResponse(t *testing.T) {
+	queue := newFakeDeliveryQueue()
+	job := deliveryJob{ID: "uncertain-job", Email: testEmail()}
+	queue.uncertain = true
+	if err := queue.Enqueue(context.Background(), job); err == nil {
+		t.Fatal("expected simulated lost enqueue response")
+	}
+	queue.uncertain = false
+	if err := queue.Enqueue(context.Background(), job); err != nil {
+		t.Fatalf("reconciled enqueue: %v", err)
+	}
+	markers, _, _ := queue.snapshot()
+	if len(markers) != 1 || markers[job.ID] == "" {
+		t.Fatalf("handoff markers after reconcile = %#v", markers)
+	}
+	select {
+	case <-queue.claims:
+		t.Fatal("reconciled enqueue appended a duplicate stream entry")
+	default:
+	}
+}
+
+func TestStartupBackfillsTerminalDeliveriesFromQueue(t *testing.T) {
+	queue := newFakeDeliveryQueue()
+	now := time.Now().UTC()
+	queue.markers["old-job"] = redisHandoffDone
+	queue.states["old-job"] = map[string]targetState{
+		"good": {Stage: targetStageSucceeded, DeliveryID: "d1", StatusCode: 204, Attempts: 1, UpdatedAt: now},
+		"bad":  {Stage: targetStageFailed, DeliveryID: "d2", StatusCode: 400, Attempts: 1, Category: "http_status", Error: "target returned HTTP 400", UpdatedAt: now},
+	}
+	history, err := newDeliveryHistory("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := &Service{queue: queue, history: history, ctx: context.Background()}
+	service.recoverTerminalDeliveries()
+	records, healthy := service.DeliveryHistory()
+	if !healthy || len(records) != 1 {
+		t.Fatalf("backfilled history = %#v, healthy=%v", records, healthy)
+	}
+	if records[0].ID != "old-job" || records[0].Status != "failed" || len(records[0].Outcomes) != 2 {
+		t.Fatalf("backfilled record = %#v", records[0])
 	}
 }
 
@@ -767,7 +1188,8 @@ func TestRedisQueueIntegration(t *testing.T) {
 		t.Skip("set OWLMAIL_TEST_REDIS_URL to run Redis Streams integration coverage")
 	}
 	ctx := context.Background()
-	queue, err := newRedisDeliveryQueue(ctx, redisURL, "owlmail:test", "test-consumer")
+	prefix := "owlmail:test:" + uuid.NewString()
+	queue, err := newRedisDeliveryQueue(ctx, redisURL, prefix, "test-consumer")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -776,14 +1198,22 @@ func TestRedisQueueIntegration(t *testing.T) {
 	if err := queue.Enqueue(ctx, job); err != nil {
 		t.Fatal(err)
 	}
+	// A lost enqueue response must reconcile instead of duplicating the entry.
+	if err := queue.Enqueue(ctx, job); err != nil {
+		t.Fatalf("idempotent enqueue: %v", err)
+	}
+	if length, err := queue.client.XLen(ctx, queue.stream).Result(); err != nil || length != 1 {
+		t.Fatalf("stream length after reconcile = %d, %v", length, err)
+	}
 	receipt, err := queue.Claim(ctx)
-	if err != nil || receipt == nil || receipt.job.ID != job.ID {
+	if err != nil || receipt == nil || receipt.job.ID != job.ID || receipt.token == "" {
 		t.Fatalf("Claim() = %#v, %v", receipt, err)
 	}
 	if err := queue.Renew(ctx, receipt); err != nil {
 		t.Fatalf("Renew() while owned: %v", err)
 	}
-	other, err := newRedisDeliveryQueue(ctx, redisURL, "owlmail:test", "other-consumer")
+	// Another generation claims the PEL entry and installs its own fence.
+	other, err := newRedisDeliveryQueue(ctx, redisURL, prefix, "other-consumer")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -794,11 +1224,34 @@ func TestRedisQueueIntegration(t *testing.T) {
 	}).Result(); err != nil {
 		t.Fatal(err)
 	}
-	if err := queue.Renew(ctx, receipt); err == nil {
-		t.Fatal("Renew() stole a lease owned by another consumer")
-	}
-	if err := other.Ack(ctx, receipt); err != nil {
+	newToken := uuid.NewString()
+	leaseKey := queue.leasePrefix + receipt.id
+	if err := other.client.Set(ctx, leaseKey, newToken, 0).Err(); err != nil {
 		t.Fatal(err)
+	}
+	if err := queue.Renew(ctx, receipt); !errors.Is(err, ErrLeaseNotOwned) {
+		t.Fatalf("stale Renew() = %v, want lease lost", err)
+	}
+	state := targetState{Stage: targetStageSucceeded, DeliveryID: "d", Attempts: 1, StatusCode: 204, UpdatedAt: time.Now().UTC()}
+	if disposition, err := queue.RecordResult(ctx, receipt, "target", state); err != nil || disposition != leaseLost {
+		t.Fatalf("stale RecordResult() = %v, %v", disposition, err)
+	}
+	if disposition, err := queue.Finalize(ctx, receipt, []string{"target"}); err != nil || disposition != finalizeLeaseLost {
+		t.Fatalf("stale Finalize() = %v, %v", disposition, err)
+	}
+	// The new generation completes the job and removes the live entry.
+	takeover := &queueReceipt{id: receipt.id, token: newToken, job: job}
+	if disposition, err := other.RecordResult(ctx, takeover, "target", state); err != nil || disposition != leaseHeld {
+		t.Fatalf("takeover RecordResult() = %v, %v", disposition, err)
+	}
+	if disposition, err := other.Finalize(ctx, takeover, []string{"target"}); err != nil || disposition != finalizeCompleted {
+		t.Fatalf("takeover Finalize() = %v, %v", disposition, err)
+	}
+	if length, err := queue.client.XLen(ctx, queue.stream).Result(); err != nil || length != 0 {
+		t.Fatalf("stream length after finalize = %d, %v", length, err)
+	}
+	if marker, err := queue.client.HGet(ctx, queue.markerKey(job.ID), "s").Result(); err != nil || marker != redisHandoffDone {
+		t.Fatalf("handoff marker after finalize = %q, %v", marker, err)
 	}
 }
 

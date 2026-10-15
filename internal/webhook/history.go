@@ -137,16 +137,66 @@ func (h *deliveryHistory) record(job deliveryJob, results []Result) {
 		o := DeliveryOutcome{Target: result.Target, StatusCode: result.StatusCode, Attempts: result.Attempts}
 		if result.Err != nil {
 			r.Status = "failed"
-			o.ErrorCategory = "transport"
-			if result.Target == "" {
-				o.ErrorCategory = "queue"
-			} else if result.StatusCode != 0 {
-				o.ErrorCategory = "http_status"
-			}
+			o.ErrorCategory = resultErrorCategory(result)
 		}
 		r.Outcomes = append(r.Outcomes, o)
 	}
 	h.records[r.ID] = r
+	h.prune()
+	h.persistenceErr = h.persist()
+}
+
+// recordTerminal persists the queryable terminal summary of a durable job from
+// its per-target stages. Retryable stages must never appear here: the job is
+// only finalized after every expected target is terminal.
+func (h *deliveryHistory) recordTerminal(job deliveryJob, states map[string]targetState, completedAt time.Time) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.storeTerminal(job, states, completedAt)
+}
+
+// backfillTerminal restores a missing terminal record from durable Redis
+// state after a restart. Existing local records are authoritative for the
+// current process and are not overwritten.
+func (h *deliveryHistory) backfillTerminal(handoff terminalHandoff) {
+	h.mu.Lock()
+	if _, exists := h.records[handoff.jobID]; exists {
+		h.mu.Unlock()
+		return
+	}
+	h.mu.Unlock()
+	job := deliveryJob{ID: handoff.jobID, Email: &types.Email{ID: handoff.emailID}}
+	h.recordTerminal(job, handoff.states, handoff.completedAt)
+}
+
+func (h *deliveryHistory) storeTerminal(job deliveryJob, states map[string]targetState, completedAt time.Time) {
+	emailID := ""
+	if job.Email != nil {
+		emailID = job.Email.ID
+	}
+	if completedAt.IsZero() {
+		completedAt = time.Now().UTC()
+	}
+	record := DeliveryRecord{
+		ID: job.ID, EmailID: emailID, RetryOf: job.RetryOf,
+		CompletedAt: completedAt, Status: "succeeded",
+		Outcomes: make([]DeliveryOutcome, 0, len(states)),
+	}
+	names := make([]string, 0, len(states))
+	for name := range states {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		state := states[name]
+		outcome := DeliveryOutcome{Target: name, StatusCode: state.StatusCode, Attempts: state.Attempts}
+		if state.Stage == targetStageFailed {
+			record.Status = "failed"
+			outcome.ErrorCategory = state.Category
+		}
+		record.Outcomes = append(record.Outcomes, outcome)
+	}
+	h.records[record.ID] = record
 	h.prune()
 	h.persistenceErr = h.persist()
 }
@@ -246,6 +296,13 @@ func (service *Service) RetryDelivery(id string, email *types.Email) error {
 		return err
 	}
 	job := deliveryJob{ID: id, RetryOf: id, EnqueuedAt: time.Now().UTC(), Email: snapshot, Targets: targets}
+	// Reopen the durable per-target stages under the same stable identities so
+	// the fresh stream entry re-attempts only the failed targets.
+	if service.queue != nil {
+		if err = service.queue.ReopenRetry(service.ctx, job, targets); err != nil {
+			return err
+		}
+	}
 	if service.outbox != nil {
 		if err = service.outbox.Store(job); err != nil {
 			return err

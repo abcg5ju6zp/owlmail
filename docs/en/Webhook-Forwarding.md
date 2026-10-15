@@ -65,15 +65,15 @@ load is controlled.
 
 ## Choose a runnable example
 
-| Scenario | Configuration |
-|---|---|
-| Minimal forwarding with the default payload | [`examples/webhooks/minimal.json`](../../examples/webhooks/minimal.json) |
-| Recipient and subject filtering | [`examples/webhooks/filtered-alerts.json`](../../examples/webhooks/filtered-alerts.json) |
-| Authenticated custom JSON and HMAC | [`examples/webhooks/custom-json.json`](../../examples/webhooks/custom-json.json) |
-| Archive plus filtered incident fan-out | [`examples/webhooks/multiple-targets.json`](../../examples/webhooks/multiple-targets.json) |
-| Plain-text request body | [`examples/webhooks/plain-text.json`](../../examples/webhooks/plain-text.json) |
-| Complete OwlMail + `soulteary/webhook` Compose stack | [`examples/webhooks/soulteary-webhook/`](../../examples/webhooks/soulteary-webhook/) |
-| Most options in one target | [`examples/webhooks.json`](../../examples/webhooks.json) |
+| Scenario                                             | Configuration                                                                              |
+| ---------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| Minimal forwarding with the default payload          | [`examples/webhooks/minimal.json`](../../examples/webhooks/minimal.json)                   |
+| Recipient and subject filtering                      | [`examples/webhooks/filtered-alerts.json`](../../examples/webhooks/filtered-alerts.json)   |
+| Authenticated custom JSON and HMAC                   | [`examples/webhooks/custom-json.json`](../../examples/webhooks/custom-json.json)           |
+| Archive plus filtered incident fan-out               | [`examples/webhooks/multiple-targets.json`](../../examples/webhooks/multiple-targets.json) |
+| Plain-text request body                              | [`examples/webhooks/plain-text.json`](../../examples/webhooks/plain-text.json)             |
+| Complete OwlMail + `soulteary/webhook` Compose stack | [`examples/webhooks/soulteary-webhook/`](../../examples/webhooks/soulteary-webhook/)       |
+| Most options in one target                           | [`examples/webhooks.json`](../../examples/webhooks.json)                                   |
 
 The [example walkthrough](../../examples/webhooks/README.md) includes a
 loopback-only receiver, exact startup commands, and a test SMTP message.
@@ -107,20 +107,20 @@ loopback-only receiver, exact startup commands, and a test SMTP message.
 }
 ```
 
-| Field | Required | Behavior |
-|---|---:|---|
-| `version` | No | Configuration version. Omitted and `1` both mean version 1. |
-| `targets` | Yes | One to 32 destinations. Target names must be unique. |
-| `name` | Yes | Safe identifier used in logs; maximum 100 UTF-8 bytes with no newline. The full URL and configured secrets are never logged. |
-| `url` | Yes | Fixed `http` or `https` URL. User information and fragments are rejected; redirects are not followed. |
-| `method` | No | `POST` by default; `POST`, `PUT`, and `PATCH` are accepted. |
-| `headers` | No | Static request headers. Header names and values are validated; `Host` and `Content-Length` cannot be overridden. |
-| `contentType` | No | `application/json` by default. An explicit `Content-Type` header takes precedence. |
-| `secret` | No | Generates replay-aware `X-OwlMail-Signature-V2` plus a legacy body-only signature. |
-| `timeout` | No | Per-attempt timeout; default `5s`, maximum `1m`. |
-| `retries` | No | Extra attempts from zero to five. Only network errors, 408, 425, 429, and 5xx responses are retried. |
-| `match` | No | Case-insensitive wildcard rules. See the rule semantics below. |
-| `bodyTemplate` | No | Go text template for a custom body. When omitted, OwlMail sends the default event payload. |
+| Field          | Required | Behavior                                                                                                                     |
+| -------------- | -------: | ---------------------------------------------------------------------------------------------------------------------------- |
+| `version`      |       No | Configuration version. Omitted and `1` both mean version 1.                                                                  |
+| `targets`      |      Yes | One to 32 destinations. Target names must be unique.                                                                         |
+| `name`         |      Yes | Safe identifier used in logs; maximum 100 UTF-8 bytes with no newline. The full URL and configured secrets are never logged. |
+| `url`          |      Yes | Fixed `http` or `https` URL. User information and fragments are rejected; redirects are not followed.                        |
+| `method`       |       No | `POST` by default; `POST`, `PUT`, and `PATCH` are accepted.                                                                  |
+| `headers`      |       No | Static request headers. Header names and values are validated; `Host` and `Content-Length` cannot be overridden.             |
+| `contentType`  |       No | `application/json` by default. An explicit `Content-Type` header takes precedence.                                           |
+| `secret`       |       No | Generates replay-aware `X-OwlMail-Signature-V2` plus a legacy body-only signature.                                           |
+| `timeout`      |       No | Per-attempt timeout; default `5s`, maximum `1m`.                                                                             |
+| `retries`      |       No | Extra attempts from zero to five. Only network errors, 408, 425, 429, and 5xx responses are retried.                         |
+| `match`        |       No | Case-insensitive wildcard rules. See the rule semantics below.                                                               |
+| `bodyTemplate` |       No | Go text template for a custom body. When omitted, OwlMail sends the default event payload.                                   |
 
 `${VARIABLE}` placeholders are supported in `url`, header values, and `secret`. OwlMail fails at startup if a referenced variable is missing or empty, rather than silently sending an unauthenticated request.
 
@@ -151,25 +151,46 @@ local file only after that queue accepts it. A temporary queue failure therefore
 leaves an outbox entry to retry. Use a persistent `-mail-directory` because the
 default process-specific temporary directory is not reused after a restart.
 
-When `OWLMAIL_WEBHOOK_REDIS_URL` is set, consumer-group workers acknowledge and
-delete a Stream entry only after every matching target succeeds. Entries left
-pending by a crashed process are reclaimed after 30 seconds. If a target still
-fails after its configured retries, OwlMail moves a record with the delivery
-error to `<prefix>:dead-letter` and removes the live entry. Redis must be
-reachable at startup; an outage after startup is absorbed by the local outbox
-until Redis accepts the handoff.
+When `OWLMAIL_WEBHOOK_REDIS_URL` is set, delivery walks recoverable stages
+keyed by stable identities. The email handoff identity is the queue job ID
+stored in the outbox file; Redis keeps a handoff marker
+(`<prefix>:handoff:<job-id>`) for it. If an `XADD` response is lost, the
+worker reconciles the original job by that identity instead of appending a
+duplicate, and the local outbox file is removed only after the marker confirms
+the handoff.
+
+Each target also has a durable per-target identity and a stage
+(`pending`, `retry`, `succeeded`, `failed`) in
+`<prefix>:deliveries:<job-id>`. Every claim installs a random claim-generation
+fencing token in `<prefix>:lease:<stream-id>` renewed by the lease heartbeat.
+A worker whose lease was reclaimed (30 seconds idle) cannot record or finalize
+late results, and the next claim sends HTTP only to targets without a terminal
+stage: a target that already succeeded is never resent, so one failed target
+cannot block the others.
+
+Consumer-group workers acknowledge and delete a Stream entry only after every
+matching target is terminal. A retryable outcome (network error, 408, 425,
+429, 5xx) keeps the entry pending for the next claim, which performs the next
+attempt; a permanent outcome records the target as `failed`, appends a record
+with the delivery error to `<prefix>:dead-letter`, and still allows the job to
+finalize once the other targets finish. Permanent failures are also visible in
+the queryable delivery history. Redis must be reachable at startup; an outage
+after startup is absorbed by the local outbox until Redis accepts the handoff.
 
 Delivery is at least once: a crash after the receiver accepts a request but
-before Redis is acknowledged can produce a duplicate. Deduplicate the stable
-`X-OwlMail-Delivery-ID`; the email ID alone is not sufficient if future event
-types can create multiple deliveries for one email. This consumer setup is
-intended for one active OwlMail instance per prefix.
+before the target stage is recorded can produce a duplicate. Deduplicate the
+stable `X-OwlMail-Delivery-ID`; the email ID alone is not sufficient if future
+event types can create multiple deliveries for one email. This consumer setup
+is intended for one active OwlMail instance per prefix.
 
-Shutdown stops SMTP intake, stops accepting queue handoffs, drains the outbox,
-queued work, and in-flight deliveries for up to `-webhook-shutdown-timeout`,
-then cancels the shared delivery context. Without Redis, the local file covers
-failures before the in-memory queue accepts a job; after that transfer the job
-is no longer restart-safe.
+Shutdown stops SMTP intake and new queue handoffs, drains the outbox and
+queued work, and either completes in-flight deliveries or releases their lease
+(leaving the Stream entry pending) within `-webhook-shutdown-timeout`, then
+cancels the shared delivery context. A restarted process joins the same
+Stream, consumer group, and per-target state under the same prefix and takes
+over the previous generation's pending entries after the reclaim window.
+Without Redis, the local file covers failures before the in-memory queue
+accepts a job; after that transfer the job is not restart-safe.
 
 ## Concurrency and backpressure
 
@@ -218,15 +239,15 @@ For example, this rule forwards alerts from any `example.com` sender only when t
 
 Templates receive these fields:
 
-| Field | Type | Notes |
-|---|---|---|
-| `.ID`, `.Subject`, `.Text`, `.HTML` | string | Email identifier and content. |
-| `.Time` | time | Parsed or received timestamp. |
-| `.From`, `.To`, `.CC`, `.BCC` | string arrays | Parsed addresses without display names. |
-| `.EnvelopeFrom`, `.EnvelopeTo` | string / string array | SMTP envelope addresses. |
-| `.Size`, `.SizeHuman` | number / string | Stored message size. |
-| `.Attachments`, `.AttachmentCount` | array / number | Safe attachment metadata; attachment bodies and local paths are not exposed. |
-| `.Headers` | map | Parsed headers, available only to an explicit template. |
+| Field                               | Type                  | Notes                                                                        |
+| ----------------------------------- | --------------------- | ---------------------------------------------------------------------------- |
+| `.ID`, `.Subject`, `.Text`, `.HTML` | string                | Email identifier and content.                                                |
+| `.Time`                             | time                  | Parsed or received timestamp.                                                |
+| `.From`, `.To`, `.CC`, `.BCC`       | string arrays         | Parsed addresses without display names.                                      |
+| `.EnvelopeFrom`, `.EnvelopeTo`      | string / string array | SMTP envelope addresses.                                                     |
+| `.Size`, `.SizeHuman`               | number / string       | Stored message size.                                                         |
+| `.Attachments`, `.AttachmentCount`  | array / number        | Safe attachment metadata; attachment bodies and local paths are not exposed. |
+| `.Headers`                          | map                   | Parsed headers, available only to an explicit template.                      |
 
 Available helpers are:
 
@@ -282,17 +303,17 @@ local storage paths are never included.
 
 ## Request headers
 
-| Header | Value |
-|---|---|
-| `Content-Type` | Target `contentType`, defaulting to `application/json`; an explicit custom header wins. |
-| `User-Agent` | `OwlMail-Webhook/1`, unless overridden by a custom header. |
-| `X-OwlMail-Event` | Always `email.received`. |
-| `X-OwlMail-Email-ID` | Exact OwlMail email ID. |
-| `X-OwlMail-Delivery-ID` | Stable queue job ID; use it as the idempotency key. |
-| `X-OwlMail-Timestamp` | UTC RFC 3339 signing time, present when `secret` is set. |
-| `X-OwlMail-Nonce` | Fresh random value for every HTTP attempt, present when `secret` is set. |
+| Header                   | Value                                                                                                                                                                                 |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Content-Type`           | Target `contentType`, defaulting to `application/json`; an explicit custom header wins.                                                                                               |
+| `User-Agent`             | `OwlMail-Webhook/1`, unless overridden by a custom header.                                                                                                                            |
+| `X-OwlMail-Event`        | Always `email.received`.                                                                                                                                                              |
+| `X-OwlMail-Email-ID`     | Exact OwlMail email ID.                                                                                                                                                               |
+| `X-OwlMail-Delivery-ID`  | Stable queue job ID; use it as the idempotency key.                                                                                                                                   |
+| `X-OwlMail-Timestamp`    | UTC RFC 3339 signing time, present when `secret` is set.                                                                                                                              |
+| `X-OwlMail-Nonce`        | Fresh random value for every HTTP attempt, present when `secret` is set.                                                                                                              |
 | `X-OwlMail-Signature-V2` | `v2=` plus lowercase HMAC-SHA256 over `timestamp + "." + nonce + "." + exact body`. Receivers should require this header, enforce a short timestamp window, and reject reused nonces. |
-| `X-OwlMail-Signature` | Legacy body-only signature retained for compatibility; it does not provide replay protection. |
+| `X-OwlMail-Signature`    | Legacy body-only signature retained for compatibility; it does not provide replay protection.                                                                                         |
 
 Retries send the same body and delivery ID but a fresh timestamp and nonce.
 
@@ -371,11 +392,14 @@ hook file. Give both containers the same `OWLMAIL_WEBHOOK_SECRET` value.
    1.6 s as needed. `Retry-After` is not interpreted.
 5. Other 3xx/4xx responses fail immediately. Response bodies are not used.
 
-Redis mode provides the persistent delivery queue, restart recovery, and a
-dead-letter Stream. Without Redis, the local outbox persists only until the
-in-memory queue accepts a job; exhausted deliveries are logged and are not
-replayed after restart. Shutdown drains accepted work up to the configured
-deadline; see the
+Redis mode provides the persistent delivery queue, per-target restart
+recovery, and a dead-letter Stream for permanently failed targets. Retryable
+outcomes retain the job and are attempted again on the next claim; a target
+that already succeeded is skipped, and a permanently failed target becomes a
+queryable terminal record without blocking the other targets. Without Redis,
+the local outbox persists only until the in-memory queue accepts a job;
+exhausted deliveries are logged and are not replayed after restart. Shutdown
+drains accepted work up to the configured deadline; see the
 [shutdown guidance](./Operations.md#shutdown-and-delivery-guarantees).
 
 For a local check, run the bundled receiver and the minimal configuration in

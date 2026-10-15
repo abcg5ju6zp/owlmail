@@ -37,7 +37,11 @@ type Result struct {
 	Target     string
 	StatusCode int
 	Attempts   int
-	Err        error
+	// Retryable reports whether the failure leaves the target eligible for a
+	// later delivery attempt. Permanent failures become a terminal target
+	// stage instead.
+	Retryable bool
+	Err       error
 }
 
 // Load creates a dispatcher from a JSON configuration file.
@@ -133,7 +137,14 @@ func (dispatcher *Dispatcher) dispatchTargets(ctx context.Context, email *types.
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	return dispatcher.dispatchSelected(ctx, email, deliveryID, dispatcher.selectTargets(email, names))
+}
 
+// selectTargets resolves the configured targets that apply to this delivery.
+// Explicit replay names bypass match filtering; a normal delivery applies the
+// configured match rules. Durable workers use this list both to skip targets
+// already in terminal stages and as the expected finalization set.
+func (dispatcher *Dispatcher) selectTargets(email *types.Email, names []string) []compiledTarget {
 	payload := newEmailPayload(email)
 	matching := make([]compiledTarget, 0, len(dispatcher.targets))
 	for _, target := range dispatcher.targets {
@@ -146,9 +157,15 @@ func (dispatcher *Dispatcher) dispatchTargets(ctx context.Context, email *types.
 		}
 		matching = append(matching, target)
 	}
-	results := make([]Result, len(matching))
+	return matching
+}
+
+// dispatchSelected fans out to an explicitly resolved target set.
+func (dispatcher *Dispatcher) dispatchSelected(ctx context.Context, email *types.Email, deliveryID string, selected []compiledTarget) []Result {
+	payload := newEmailPayload(email)
+	results := make([]Result, len(selected))
 	var deliveries sync.WaitGroup
-	for index, target := range matching {
+	for index, target := range selected {
 		deliveries.Add(1)
 		go func() {
 			defer deliveries.Done()
@@ -162,6 +179,15 @@ func (dispatcher *Dispatcher) dispatchTargets(ctx context.Context, email *types.
 	}
 	deliveries.Wait()
 	return results
+}
+
+// targetNames returns the ordered names of a resolved target set.
+func targetNames(targets []compiledTarget) []string {
+	names := make([]string, 0, len(targets))
+	for _, target := range targets {
+		names = append(names, target.name)
+	}
+	return names
 }
 
 func (dispatcher *Dispatcher) deliver(ctx context.Context, target compiledTarget, payload EmailPayload, deliveryID string) Result {
@@ -182,9 +208,11 @@ func (dispatcher *Dispatcher) deliver(ctx context.Context, target compiledTarget
 		result.StatusCode = statusCode
 		if requestErr == nil {
 			result.Err = nil
+			result.Retryable = false
 			return result
 		}
 		result.Err = requestErr
+		result.Retryable = retry
 		if !retry || attempt == target.retries || ctx.Err() != nil {
 			return result
 		}

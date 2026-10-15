@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -117,6 +118,9 @@ func NewService(dispatcher *Dispatcher, options ServiceOptions) (*Service, error
 	service.history = history
 	service.accepting = true
 	service.start()
+	// Rebuild queryable terminal records from the durable Redis generation
+	// before accepting new handoffs; failures stay diagnostic.
+	service.recoverTerminalDeliveries()
 	return service, nil
 }
 
@@ -435,12 +439,6 @@ func (service *Service) nextJob() (deliveryJob, *queueReceipt, bool) {
 		}
 	}
 	for {
-		if !service.isAccepting() {
-			pending, err := service.queue.Pending(service.ctx)
-			if err == nil && pending == 0 {
-				return deliveryJob{}, nil, false
-			}
-		}
 		receipt, err := service.queue.Claim(service.ctx)
 		if err != nil {
 			if service.ctx.Err() != nil {
@@ -452,6 +450,12 @@ func (service *Service) nextJob() (deliveryJob, *queueReceipt, bool) {
 		if receipt != nil {
 			return receipt.job, receipt, true
 		}
+		// While draining, do not wait to reclaim entries this process just
+		// released: the restarted process takes over the same queue generation
+		// after the idle window.
+		if !service.isAccepting() {
+			return deliveryJob{}, nil, false
+		}
 	}
 }
 
@@ -462,27 +466,17 @@ func (service *Service) isAccepting() bool {
 }
 
 func (service *Service) deliver(job deliveryJob, receipt *queueReceipt) {
-	stopLease := service.startLeaseHeartbeat(receipt)
+	if service.queue == nil {
+		service.deliverInMemory(job)
+		return
+	}
+	service.deliverDurable(job, receipt)
+}
+
+// deliverInMemory keeps the non-durable path unchanged: no Redis, no
+// restart-safe per-target stages, one dispatch and one diagnostic record.
+func (service *Service) deliverInMemory(job deliveryJob) {
 	results := service.dispatcher.dispatchTargets(service.ctx, job.Email, job.ID, job.Targets)
-	stopLease()
-	failed := false
-	for _, result := range results {
-		if result.Err != nil {
-			failed = true
-			break
-		}
-	}
-	if service.queue != nil {
-		var err error
-		if failed {
-			err = service.queue.DeadLetter(service.ctx, receipt, results)
-		} else {
-			err = service.queue.Ack(service.ctx, receipt)
-		}
-		if err != nil {
-			results = append(results, Result{Err: err})
-		}
-	}
 	if service.history != nil {
 		service.history.record(job, results)
 	}
@@ -490,7 +484,126 @@ func (service *Service) deliver(job deliveryJob, receipt *queueReceipt) {
 	service.report(job.ID, results)
 }
 
-func (service *Service) startLeaseHeartbeat(receipt *queueReceipt) func() {
+// deliverDurable walks the recoverable per-target stages. Each target stage is
+// written to Redis behind the claim-generation fence; only targets without a
+// terminal stage receive an HTTP attempt. The job is acknowledged only after
+// every expected target is terminal, while retryable targets retain the entry
+// for a later claim and permanent failures become queryable terminal state.
+func (service *Service) deliverDurable(job deliveryJob, receipt *queueReceipt) {
+	deliveryCtx, cancel := context.WithCancel(service.ctx)
+	var leaseStolen atomic.Bool
+	stopLease := service.startLeaseHeartbeat(receipt, func() {
+		leaseStolen.Store(true)
+		cancel()
+	})
+
+	selected := service.dispatcher.selectTargets(job.Email, job.Targets)
+	states, err := service.queue.TargetStates(deliveryCtx, job.ID)
+	if err != nil {
+		stopLease()
+		if service.ctx.Err() == nil && !leaseStolen.Load() {
+			service.report(job.ID, []Result{{Err: err}})
+		}
+		return
+	}
+	plan := make([]compiledTarget, 0, len(selected))
+	for _, target := range selected {
+		state, seen := states[target.name]
+		if !seen {
+			plan = append(plan, target)
+			continue
+		}
+		if state.terminal() {
+			continue
+		}
+		if state.Stage == targetStageRetry && !state.NotBefore.IsZero() && state.NotBefore.After(time.Now().UTC()) {
+			continue
+		}
+		plan = append(plan, target)
+	}
+	results := service.dispatcher.dispatchSelected(deliveryCtx, job.Email, job.ID, plan)
+	stopLease()
+
+	// Shutdown or a stolen lease aborted the attempt: the PEL entry stays for
+	// the next claim generation, so no late result is written.
+	if service.ctx.Err() != nil || leaseStolen.Load() {
+		if leaseStolen.Load() {
+			service.report(job.ID, []Result{{Err: ErrLeaseNotOwned}})
+		}
+		return
+	}
+
+	now := time.Now().UTC()
+	for _, result := range results {
+		state := classifyTargetResult(job.ID, states[result.Target], result, now)
+		disposition, recordErr := service.queue.RecordResult(service.ctx, receipt, result.Target, state)
+		if recordErr != nil {
+			service.report(job.ID, []Result{{Err: recordErr}})
+			return
+		}
+		switch disposition {
+		case leaseHeld:
+			states[result.Target] = state
+		case leaseFinalized:
+			return
+		case leaseLost:
+			service.report(job.ID, []Result{{Err: ErrLeaseNotOwned}})
+			return
+		}
+	}
+
+	expected := targetNames(selected)
+	disposition, err := service.queue.Finalize(service.ctx, receipt, expected)
+	if err != nil {
+		service.report(job.ID, []Result{{Err: err}})
+		return
+	}
+	switch disposition {
+	case finalizeCompleted, finalizeAlreadyDone:
+		latest, statesErr := service.queue.TargetStates(service.ctx, job.ID)
+		if statesErr != nil {
+			service.report(job.ID, []Result{{Err: statesErr}})
+			return
+		}
+		if service.history != nil {
+			service.history.recordTerminal(job, latest, time.Now().UTC())
+		}
+		service.replays.Delete(job.ID)
+		service.report(job.ID, resultsFromStates(expected, latest))
+	case finalizeLeaseLost:
+		service.report(job.ID, []Result{{Err: ErrLeaseNotOwned}})
+	case finalizeRetained:
+		// Retryable targets keep the stream entry for the next claim; the
+		// fence was released server-side. This round's outcomes stay visible.
+		service.report(job.ID, results)
+	}
+}
+
+// resultsFromStates rebuilds the ordered outcome list from durable stages.
+func resultsFromStates(expected []string, states map[string]targetState) []Result {
+	results := make([]Result, 0, len(expected))
+	for _, name := range expected {
+		state, ok := states[name]
+		if !ok {
+			continue
+		}
+		result := Result{Target: name, StatusCode: state.StatusCode, Attempts: state.Attempts}
+		if state.Stage == targetStageFailed {
+			result.Err = errors.New(state.Error)
+		}
+		if state.Stage == targetStageRetry {
+			result.Retryable = true
+			result.Err = errors.New(state.Error)
+		}
+		results = append(results, result)
+	}
+	return results
+}
+
+// startLeaseHeartbeat keeps the claim-generation fence alive while HTTP
+// delivery is active. Losing the fence invokes onLeaseLost so the delivery
+// context is canceled before any late result can be submitted.
+func (service *Service) startLeaseHeartbeat(receipt *queueReceipt, onLeaseLost func()) func() {
 	if service.queue == nil || receipt == nil || service.leaseRefresh <= 0 {
 		return func() {}
 	}
@@ -503,7 +616,17 @@ func (service *Service) startLeaseHeartbeat(receipt *queueReceipt) func() {
 		for {
 			select {
 			case <-ticker.C:
-				if err := service.queue.Renew(ctx, receipt); err != nil && ctx.Err() == nil {
+				err := service.queue.Renew(ctx, receipt)
+				if err == nil {
+					continue
+				}
+				if errors.Is(err, ErrLeaseNotOwned) {
+					if onLeaseLost != nil {
+						onLeaseLost()
+					}
+					return
+				}
+				if ctx.Err() == nil {
 					service.report(receipt.job.ID, []Result{{Err: err}})
 				}
 			case <-ctx.Done():
@@ -514,6 +637,23 @@ func (service *Service) startLeaseHeartbeat(receipt *queueReceipt) func() {
 	return func() {
 		cancel()
 		<-done
+	}
+}
+
+// recoverTerminalDeliveries backfills the queryable history from the durable
+// Redis generation after a restart. The stream/PEL and per-target states are
+// the source of truth; this only restores the diagnostic view.
+func (service *Service) recoverTerminalDeliveries() {
+	if service.queue == nil || service.history == nil {
+		return
+	}
+	handoffs, err := service.queue.RecoverTerminal(service.ctx)
+	if err != nil {
+		service.report("", []Result{{Err: err}})
+		return
+	}
+	for _, handoff := range handoffs {
+		service.history.backfillTerminal(handoff)
 	}
 }
 
